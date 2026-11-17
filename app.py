@@ -1,6 +1,6 @@
 # ==============================================================================
 # DIGICRAFT MATRIX PALACE - PART 1 OF 3
-# Core Engine, 7-Day Archive, DMC Swatches, Wing A (Textile) & Wing B (PBR/STL)
+# Auth & Admin System, 7-Day Auto-Gallery, Normal-Mapped Cutout STL Engine
 # ==============================================================================
 import os
 import time
@@ -8,9 +8,11 @@ import math
 import json
 import struct
 import base64
+import random
+import smtplib
+from email.message import EmailMessage
 import re
 import gradio as gr
-import google.generativeai as genai
 import PIL.Image
 import PIL.ImageDraw
 import PIL.ImageOps
@@ -19,30 +21,233 @@ import numpy as np
 from skimage import measure
 from skimage.filters import gaussian
 
-# חיבור מפתח Gemini API מהשרת ב-Render
-api_key = os.environ.get("GEMINI_API_KEY")
-if api_key:
-    genai.configure(api_key=api_key)
+try:
+    import google.generativeai as genai
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key:
+        genai.configure(api_key=api_key)
+except Exception:
+    genai = None
 
 # ==========================================
-# 1. ניהול ארכיון והיסטוריה אוטומטי ל-7 ימים
+# 1. מערכת משתמשים, אנליטיקס, שחזור סיסמה וארכיון 7 ימים
 # ==========================================
-HISTORY_DIR = "studio_history"
-HISTORY_META = os.path.join(HISTORY_DIR, "metadata.json")
+DATA_DIR = "studio_data"
+HISTORY_DIR = os.path.join(DATA_DIR, "history")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+HISTORY_META = os.path.join(DATA_DIR, "history_meta.json")
 RETENTION_SECONDS = 7 * 24 * 3600  # 7 ימים
 
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
 
-def clean_and_load_history():
-    if not os.path.exists(HISTORY_META):
-        return []
-    try:
-        with open(HISTORY_META, "r", encoding="utf-8") as f:
-            items = json.load(f)
-    except Exception:
-        items = []
+def init_databases():
+    if not os.path.exists(USERS_FILE):
+        default_users = {
+            "mai": {
+                "username": "mai",
+                "password": "DigiCraft2026",
+                "email": "mai@digicraft.studio",
+                "role": "admin",
+                "created_at": time.strftime("%d/%m/%Y %H:%M"),
+                "creations_count": 0,
+                "last_login": time.strftime("%d/%m/%Y %H:%M")
+            }
+        }
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_users, f, ensure_ascii=False, indent=2)
 
+    if not os.path.exists(STATS_FILE):
+        default_stats = {
+            "total_visits": 1,
+            "total_logins": 1,
+            "total_generations": 0,
+            "room_usage": {},
+            "recent_events": [
+                {"time": time.strftime("%d/%m/%Y %H:%M"), "event": "אתחול מערכת DigiCraft Palace"}
+            ],
+            "reset_codes": {}
+        }
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_stats, f, ensure_ascii=False, indent=2)
+
+
+init_databases()
+
+
+def load_json(path, default_val):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_val
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def log_event(event_text):
+    stats = load_json(STATS_FILE, {"total_visits": 1, "total_logins": 1, "total_generations": 0, "room_usage": {}, "recent_events": [], "reset_codes": {}})
+    stats["recent_events"].insert(0, {"time": time.strftime("%d/%m/%Y %H:%M:%S"), "event": event_text})
+    stats["recent_events"] = stats["recent_events"][:50]
+    save_json(STATS_FILE, stats)
+
+
+def record_visit():
+    stats = load_json(STATS_FILE, {"total_visits": 0, "total_logins": 0, "total_generations": 0, "room_usage": {}, "recent_events": [], "reset_codes": {}})
+    stats["total_visits"] = stats.get("total_visits", 0) + 1
+    save_json(STATS_FILE, stats)
+
+
+def handle_login(username, password):
+    u = (username or "").strip().lower()
+    p = (password or "").strip()
+    users = load_json(USERS_FILE, {})
+    if u in users and users[u]["password"] == p:
+        users[u]["last_login"] = time.strftime("%d/%m/%Y %H:%M")
+        save_json(USERS_FILE, users)
+        stats = load_json(STATS_FILE, {})
+        stats["total_logins"] = stats.get("total_logins", 0) + 1
+        save_json(STATS_FILE, stats)
+        log_event(f"התחברות משתמש: {u}")
+        role_label = "מנהלת מערכת (Admin)" if users[u].get("role") == "admin" else "משתמש רשום"
+        badge = f"🟢 מחובר/ת: {u} ({role_label}) — שמירה אוטומטית בגלריה פעילה"
+        return u, badge, f"<div class='telemetry-box' style='color:#4caf50;'>התחברת בהצלחה בתור <b>{u}</b>!</div>"
+    return "guest", "👤 מצב אורח (ללא שמירה בגלריה)", "<div class='telemetry-box' style='color:#ff5252;'>שם משתמש או סיסמה שגויים.</div>"
+
+
+def handle_register(username, email, password):
+    u = (username or "").strip().lower()
+    e = (email or "").strip().lower()
+    p = (password or "").strip()
+    if len(u) < 2 or len(p) < 4 or "@" not in e:
+        return "guest", "👤 מצב אורח", "<div class='telemetry-box' style='color:#ff5252;'>נא להזין שם משתמש (לפחות 2 תווים), דוא\"ל תקין וסיסמה (לפחות 4 תווים).</div>"
+    users = load_json(USERS_FILE, {})
+    if u in users:
+        return "guest", "👤 מצב אורח", "<div class='telemetry-box' style='color:#ff5252;'>שם המשתמש כבר קיים במערכת.</div>"
+    users[u] = {
+        "username": u,
+        "password": p,
+        "email": e,
+        "role": "user",
+        "created_at": time.strftime("%d/%m/%Y %H:%M"),
+        "creations_count": 0,
+        "last_login": time.strftime("%d/%m/%Y %H:%M")
+    }
+    save_json(USERS_FILE, users)
+    log_event(f"הרשמת משתמש חדש: {u} ({e})")
+    badge = f"🟢 מחובר/ת: {u} (משתמש רשום) — שמירה אוטומטית בגלריה פעילה"
+    return u, badge, f"<div class='telemetry-box' style='color:#4caf50;'>נרשמת והתחברת בהצלחה בתור <b>{u}</b>! כל יצירה שלך תישמר בגלריה ל-7 ימים.</div>"
+
+
+def handle_guest_mode():
+    return "guest", "👤 מצב אורח (ללא שמירה בגלריה)", "<div class='telemetry-box'>עברת למצב אורח. קבצים ניתנים להורדה ישירה אך לא יישמרו בגלריה.</div>"
+
+
+def send_recovery_email(email_addr):
+    e = (email_addr or "").strip().lower()
+    users = load_json(USERS_FILE, {})
+    found_user = None
+    for uname, udata in users.items():
+        if udata.get("email", "").lower() == e:
+            found_user = uname
+            break
+    if not found_user:
+        return "<div class='telemetry-box' style='color:#ff5252;'>לא נמצא משתמש הרשום תחת כתובת הדוא\"ל הזו.</div>"
+
+    code = str(random.randint(100000, 999999))
+    stats = load_json(STATS_FILE, {})
+    if "reset_codes" not in stats:
+        stats["reset_codes"] = {}
+    stats["reset_codes"][e] = {"code": code, "user": found_user, "time": time.time()}
+    save_json(STATS_FILE, stats)
+    log_event(f"בקשת שחזור סיסמה עבור: {found_user} ({e})")
+
+    smtp_user = os.environ.get("SMTP_EMAIL")
+    smtp_pass = os.environ.get("SMTP_PASSWORD")
+    if smtp_user and smtp_pass:
+        try:
+            msg = EmailMessage()
+            msg["Subject"] = "DigiCraft Matrix - קוד שחזור סיסמה"
+            msg["From"] = smtp_user
+            msg["To"] = e
+            msg.set_content(f"שלום {found_user},\nקוד השחזור שלך ל-DigiCraft Matrix הוא: {code}\nהזיני אותו בלשונית שחזור הסיסמה באתר.")
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+            return f"<div class='telemetry-box' style='color:#4caf50;'>קוד שחזור נשלח בהצלחה אל <b>{e}</b>! הזיני אותו למטה לבחירת סיסמה חדשה.</div>"
+        except Exception as ex:
+            return f"<div class='telemetry-box' style='color:#ffb74d;'>הופק קוד שחזור עבור <b>{found_user}</b>. (הערת שרת דוא\"ל: {str(ex)} | קוד שחזור מיידי לבדיקה: <b>{code}</b>)</div>"
+    else:
+        return f"<div class='telemetry-box' style='color:#4caf50;'>קוד שחזור הופק עבור <b>{found_user}</b> ({e}): קוד האימות שלך הוא <b>{code}</b> (הזיני אותו בשדה למטה כדי לעדכן סיסמה).</div>"
+
+
+def reset_password_with_code(email_addr, code_input, new_pass):
+    e = (email_addr or "").strip().lower()
+    c = (code_input or "").strip()
+    np_str = (new_pass or "").strip()
+    if len(np_str) < 4:
+        return "<div class='telemetry-box' style='color:#ff5252;'>הסיסמה החדשה חייבת להכיל לפחות 4 תווים.</div>"
+    stats = load_json(STATS_FILE, {})
+    rec = stats.get("reset_codes", {}).get(e)
+    if not rec or rec.get("code") != c:
+        return "<div class='telemetry-box' style='color:#ff5252;'>קוד האימות שגוי או שפג תוקפו.</div>"
+
+    uname = rec["user"]
+    users = load_json(USERS_FILE, {})
+    if uname in users:
+        users[uname]["password"] = np_str
+        save_json(USERS_FILE, users)
+        del stats["reset_codes"][e]
+        save_json(STATS_FILE, stats)
+        log_event(f"סיסמה אופסה בהצלחה עבור: {uname}")
+        return f"<div class='telemetry-box' style='color:#4caf50;'>הסיסמה עבור <b>{uname}</b> עודכנה בהצלחה! כעת ניתן להתחבר.</div>"
+    return "<div class='telemetry-box' style='color:#ff5252;'>שגיאה באיתור המשתמש.</div>"
+
+
+def get_admin_dashboard(current_user):
+    users = load_json(USERS_FILE, {})
+    u_info = users.get(str(current_user).lower(), {})
+    if u_info.get("role") != "admin":
+        return "<div class='telemetry-box' style='color:#ff5252;'>🔒 גישה לחדר הבקרה מורשית למנהלת המערכת בלבד (התחברי עם המשתמש <b>mai</b>).</div>"
+
+    stats = load_json(STATS_FILE, {})
+    items = clean_and_load_history()
+
+    html = [
+        "<div class='telemetry-box'>",
+        "<h3 style='color:#e86c52; margin-top:0;'>🛡️ חדר בקרה למנהלת (Admin Control Room)</h3>",
+        f"<div style='display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px;'>",
+        f"<div class='swatch-card'><div><div class='swatch-hex'>{stats.get('total_visits', 1)}</div><div class='swatch-meta'>סה\"כ כניסות לאתר</div></div></div>",
+        f"<div class='swatch-card'><div><div class='swatch-hex'>{len(users)}</div><div class='swatch-meta'>משתמשים רשומים</div></div></div>",
+        f"<div class='swatch-card'><div><div class='swatch-hex'>{stats.get('total_generations', 0)}</div><div class='swatch-meta'>סה\"כ יצירות שג'ונרטו</div></div></div>",
+        f"<div class='swatch-card'><div><div class='swatch-hex'>{len(items)}</div><div class='swatch-meta'>קבצים פעילים בארכיון</div></div></div>",
+        "</div>",
+        "<h4>👥 רשימת משתמשים רשומים</h4>",
+        "<table style='width:100%; border-collapse:collapse; font-size:12px; margin-bottom:16px;'>",
+        "<tr style='border-bottom:1px solid #444; color:#d4a359; text-align:right;'><th>שם משתמש</th><th>דוא\"ל</th><th>הרשאה</th><th>תאריך הצטרפות</th><th>כניסה אחרונה</th><th>יצירות</th></tr>"
+    ]
+    for uname, ud in users.items():
+        html.append(f"<tr style='border-bottom:1px solid #26262e;'><td><b>{uname}</b></td><td>{ud.get('email','')}</td><td>{ud.get('role','user')}</td><td>{ud.get('created_at','')}</td><td>{ud.get('last_login','')}</td><td>{ud.get('creations_count',0)}</td></tr>")
+    html.append("</table>")
+
+    html.append("<h4>📊 פילוח שימוש לפי חדרים</h4><ul>")
+    for rname, rcount in stats.get("room_usage", {}).items():
+        html.append(f"<li><b>{rname}:</b> {rcount} יצירות</li>")
+    html.append("</ul>")
+
+    html.append("<h4>🕒 יומן אירועים אחרונים באתר</h4><ul>")
+    for ev in stats.get("recent_events", [])[:15]:
+        html.append(f"<li><span style='color:#888;'>[{ev.get('time','')}]</span> {ev.get('event','')}</li>")
+    html.append("</ul></div>")
+    return "".join(html)
+
+
+def clean_and_load_history():
+    items = load_json(HISTORY_META, [])
     now = time.time()
     valid_items = []
     for item in items:
@@ -56,21 +261,34 @@ def clean_and_load_history():
                         os.remove(p)
                     except Exception:
                         pass
-
-    with open(HISTORY_META, "w", encoding="utf-8") as f:
-        json.dump(valid_items, f, ensure_ascii=False, indent=2)
+    save_json(HISTORY_META, valid_items)
     return valid_items
 
 
-def save_to_history(user_mode, room_name, svg_path=None, png_path=None, stl_path=None):
-    if "אורח" in str(user_mode):
+def save_to_history(current_user, room_name, svg_path=None, png_path=None, stl_path=None):
+    u = str(current_user or "mai").strip().lower()
+    stats = load_json(STATS_FILE, {})
+    stats["total_generations"] = stats.get("total_generations", 0) + 1
+    ru = stats.get("room_usage", {})
+    ru[room_name] = ru.get(room_name, 0) + 1
+    stats["room_usage"] = ru
+    save_json(STATS_FILE, stats)
+
+    if u == "guest" or "אורח" in u:
         return
+
+    users = load_json(USERS_FILE, {})
+    if u in users:
+        users[u]["creations_count"] = users[u].get("creations_count", 0) + 1
+        save_json(USERS_FILE, users)
+
     items = clean_and_load_history()
     ts = int(time.time())
-    time_str = time.strftime("%d/%m/%Y %H:%M", time.localtime(ts))
+    time_str = time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(ts))
 
     entry = {
         "id": f"job_{ts}_{len(items)}",
+        "user": u,
         "timestamp": ts,
         "date": time_str,
         "room": room_name,
@@ -79,36 +297,46 @@ def save_to_history(user_mode, room_name, svg_path=None, png_path=None, stl_path
         "stl_path": stl_path
     }
     items.insert(0, entry)
-    with open(HISTORY_META, "w", encoding="utf-8") as f:
-        json.dump(items[:60], f, ensure_ascii=False, indent=2)
+    save_json(HISTORY_META, items[:80])
 
 
-def get_history_display():
+def get_history_display(current_user="mai"):
+    u = str(current_user or "mai").strip().lower()
+    if u == "guest":
+        return [], [], "<div class='telemetry-box' style='color:#ffb74d;'>את/ה במצב אורח. התחבר/י עם שם משתמש וסיסמה כדי שכל יצירה תישמר אוטומטית בגלריה ל-7 ימים.</div>"
+
     items = clean_and_load_history()
+    users = load_json(USERS_FILE, {})
+    is_admin = users.get(u, {}).get("role") == "admin"
+
     gallery_imgs = []
     files_list = []
-    if not items:
-        return [], [], "<div class='telemetry-box'>הגלריה ריקה כרגע. תוצרים שייווצרו במצב 'משתמשת רשומה' יישמרו כאן למשך 7 ימים.</div>"
+    user_items = [it for it in items if is_admin or it.get("user") == u]
 
-    rows_html = ["<div class='telemetry-box'><h4>יומן תוצרים שמורים בארכיון (תוקף: 7 ימים)</h4><ul>"]
-    for item in items:
+    if not user_items:
+        return [], [], f"<div class='telemetry-box'>הגלריה של <b>{u}</b> ריקה כרגע. כל תוצר שתייצרי בחדרים יופיע כאן אוטומטית ללא צורך להוריד למחשב!</div>"
+
+    rows_html = [f"<div class='telemetry-box'><h4>🗂️ ארכיון יצירות אוטומטי ({len(user_items)} פריטים פעילים ל-7 ימים)</h4><ul>"]
+    for item in user_items:
         png_p = item.get("png_path")
         svg_p = item.get("svg_path")
         stl_p = item.get("stl_path")
+        owner = item.get("user", "mai")
+        caption = f"{item['room']} | {item['date']} ({owner})"
         if png_p and os.path.exists(png_p):
-            gallery_imgs.append((png_p, f"{item['room']} ({item['date']})"))
+            gallery_imgs.append((png_p, caption))
             files_list.append(png_p)
         if svg_p and os.path.exists(svg_p):
             files_list.append(svg_p)
         if stl_p and os.path.exists(stl_p):
             files_list.append(stl_p)
-        rows_html.append(f"<li><b>{item['date']}</b> | {item['room']}</li>")
+        rows_html.append(f"<li><b>{item['date']}</b> — {item['room']} (משתמש: {owner})</li>")
     rows_html.append("</ul></div>")
     return gallery_imgs, files_list, "".join(rows_html)
 
 
 # ==========================================
-# 2. מאגר חוטי DMC ודוגמיות צבע ויזואליות (Swatches)
+# 2. מאגר חוטי DMC, ניקוי תמונות ודוגמיות צבע (Swatches)
 # ==========================================
 DMC_PALETTE = [
     ("DMC-310", "Black", (0, 0, 0)),
@@ -145,7 +373,6 @@ def find_closest_dmc(r, g, b):
 
 
 def ensure_clean_rgb(image_path):
-    """טעינת תמונה חכמה המנקה שקיפויות וצילומי מסך של טקסט לרקע לבן חלק"""
     if not image_path:
         raise ValueError("לא נבחרה תמונה. אנא העלי קובץ תמונה.")
     img = PIL.Image.open(image_path)
@@ -170,7 +397,6 @@ def get_luminance(r, g, b):
 
 
 def build_color_swatches_html(color_counts, total_pixels):
-    """מייצר כרטיסיות צבע ויזואליות (Swatch Box) לצד קוד ה-HEX, חוט ה-DMC ואחוז הכיסוי"""
     html = [
         "<div class='swatch-panel'>",
         "<div class='swatch-title'>פלטת גוונים פעילה ומיפוי חוטי DMC (LIVE FEED)</div>",
@@ -196,7 +422,7 @@ def build_color_swatches_html(color_counts, total_pixels):
 
 
 # ==========================================
-# 3. מנוע המרת SVG ל-PNG ברזולוציה גבוהה
+# 3. מנוע המרת SVG ל-PNG ומנוע 3D STL עם חישוב תאורה וחיתוך סילואט ללא משטח ריבועי!
 # ==========================================
 def parse_svg_path_points(d_str, ox, oy, scale):
     tokens = re.findall(r'[MLQZmlqz]|-?\d+(?:\.\d+)?', d_str)
@@ -258,7 +484,7 @@ def render_svg_to_png(svg_code, output_png_path, target_max_dim=1400):
     img_w = max(10, int(vw * scale))
     img_h = max(10, int(vh * scale))
 
-    img = PIL.Image.new("RGB", (img_w, img_h), "#141414")
+    img = PIL.Image.new("RGB", (img_w, img_h), "#141417")
     draw = PIL.ImageDraw.Draw(img)
 
     class_strokes = {
@@ -269,7 +495,7 @@ def render_svg_to_png(svg_code, output_png_path, target_max_dim=1400):
         "spec": ("#888888", 1)
     }
 
-    for tag_match in re.finditer(r'<(rect|circle|line|polygon|path|text)\b([^>]*)/?>', svg_code):
+    for tag_match in re.finditer(r'<(rect|circle|line|polygon|path)\b([^>]*)/?>', svg_code):
         tag = tag_match.group(1)
         attrs = tag_match.group(2)
 
@@ -286,7 +512,7 @@ def render_svg_to_png(svg_code, output_png_path, target_max_dim=1400):
         else:
             sw_px = max(1, int(sw * scale))
 
-        fill_col = None if fill in ("none", "transparent", None) else fill
+        fill_col = None if fill in ("none", "transparent", None) or str(fill).startswith("url(") else fill
         stroke_col = None if stroke in ("none", "transparent", None) else stroke
 
         try:
@@ -332,8 +558,8 @@ def render_svg_to_png(svg_code, output_png_path, target_max_dim=1400):
     return output_png_path
 
 
-def save_dual_outputs(svg_code, base_name, user_mode, room_title, custom_png_img=None):
-    ts = int(time.time())
+def save_dual_outputs(svg_code, base_name, current_user, room_title, custom_png_img=None):
+    ts = int(time.time() * 1000)
     svg_file = os.path.join(HISTORY_DIR, f"{base_name}_{ts}.svg")
     png_file = os.path.join(HISTORY_DIR, f"{base_name}_{ts}.png")
 
@@ -345,14 +571,110 @@ def save_dual_outputs(svg_code, base_name, user_mode, room_title, custom_png_img
     else:
         render_svg_to_png(svg_code, png_file)
 
-    save_to_history(user_mode, room_title, svg_path=svg_file, png_path=png_file)
+    save_to_history(current_user, room_title, svg_path=svg_file, png_path=png_file)
     return svg_file, png_file
 
+
+def write_binary_stl_with_normals(all_tris, stl_path):
+    """כותב קובץ STL בינארי עם חישוב וקטורי תאורה (Surface Normals) לתצוגת 3D בהירה ומדויקת"""
+    v1 = all_tris[:, 0, :]
+    v2 = all_tris[:, 1, :]
+    v3 = all_tris[:, 2, :]
+    normals = np.cross(v2 - v1, v3 - v1)
+    norms = np.linalg.norm(normals, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    normals = normals / norms
+
+    num_tris = all_tris.shape[0]
+    stl_dtype = np.dtype([
+        ('normal', '<f4', (3,)),
+        ('v1', '<f4', (3,)),
+        ('v2', '<f4', (3,)),
+        ('v3', '<f4', (3,)),
+        ('attr', '<u2')
+    ])
+    data = np.zeros(num_tris, dtype=stl_dtype)
+    data['normal'] = normals.astype(np.float32)
+    data['v1'] = v1.astype(np.float32)
+    data['v2'] = v2.astype(np.float32)
+    data['v3'] = v3.astype(np.float32)
+
+    with open(stl_path, 'wb') as f:
+        header = b"DIGICRAFT_PALACE_WATERTIGHT_STL".ljust(80, b' ')
+        f.write(header)
+        f.write(struct.pack('<I', num_tris))
+        f.write(data.tobytes())
+    return stl_path
+
+
+def heightmap_to_watertight_stl(z_grid, stl_path, width_mm=100.0, height_mm=100.0, base_mm=1.8, relief_mm=2.5, cutout_bg=True, cutoff_thresh=0.08):
+    """
+    מייצר STL אטום (Watertight).
+    אם cutout_bg=True: מסיר לחלוטין את המשטח הריבועי סביב האובייקט ובונה קירות אטומים רק סביב הצורה עצמה!
+    """
+    ny, nx = z_grid.shape
+    xs = np.linspace(0.0, width_mm, nx, dtype=np.float32)
+    ys = np.linspace(height_mm, 0.0, ny, dtype=np.float32)
+    xv, yv = np.meshgrid(xs, ys)
+    zv = base_mm + (z_grid.astype(np.float32) * relief_mm)
+
+    p00 = np.stack([xv[:-1, :-1], yv[:-1, :-1], zv[:-1, :-1]], axis=-1)
+    p10 = np.stack([xv[:-1, 1:], yv[:-1, 1:], zv[:-1, 1:]], axis=-1)
+    p01 = np.stack([xv[1:, :-1], yv[1:, :-1], zv[1:, :-1]], axis=-1)
+    p11 = np.stack([xv[1:, 1:], yv[1:, 1:], zv[1:, 1:]], axis=-1)
+
+    b00 = np.stack([xv[:-1, :-1], yv[:-1, :-1], np.zeros_like(zv[:-1, :-1])], axis=-1)
+    b10 = np.stack([xv[:-1, 1:], yv[:-1, 1:], np.zeros_like(zv[:-1, 1:])], axis=-1)
+    b01 = np.stack([xv[1:, :-1], yv[1:, :-1], np.zeros_like(zv[1:, :-1])], axis=-1)
+    b11 = np.stack([xv[1:, 1:], yv[1:, 1:], np.zeros_like(zv[1:, 1:])], axis=-1)
+
+    cell_val = 0.25 * (z_grid[:-1, :-1] + z_grid[:-1, 1:] + z_grid[1:, :-1] + z_grid[1:, 1:])
+    if cutout_bg:
+        mask = cell_val > cutoff_thresh
+        if not np.any(mask):
+            mask = np.ones_like(cell_val, dtype=bool)
+    else:
+        mask = np.ones_like(cell_val, dtype=bool)
+
+    tris = []
+    # משטח עליון (Top Surface)
+    tris.append(np.stack([p00[mask], p01[mask], p11[mask]], axis=1))
+    tris.append(np.stack([p00[mask], p11[mask], p10[mask]], axis=1))
+    # משטח תחתון (Bottom Flat Surface)
+    tris.append(np.stack([b00[mask], b11[mask], b01[mask]], axis=1))
+    tris.append(np.stack([b00[mask], b10[mask], b11[mask]], axis=1))
+
+    # קירות היקפיים סביב הסילואט בלבד (Boundary Silhouette Walls)
+    pad = np.pad(mask, 1, mode='constant', constant_values=False)
+    top_b = mask & (~pad[:-2, 1:-1])
+    bot_b = mask & (~pad[2:, 1:-1])
+    left_b = mask & (~pad[1:-1, :-2])
+    right_b = mask & (~pad[1:-1, 2:])
+
+    if np.any(top_b):
+        tris.append(np.stack([p00[top_b], p10[top_b], b10[top_b]], axis=1))
+        tris.append(np.stack([p00[top_b], b10[top_b], b00[top_b]], axis=1))
+    if np.any(bot_b):
+        tris.append(np.stack([p11[bot_b], p01[bot_b], b01[bot_b]], axis=1))
+        tris.append(np.stack([p11[bot_b], b01[bot_b], b11[bot_b]], axis=1))
+    if np.any(left_b):
+        tris.append(np.stack([p01[left_b], p00[left_b], b00[left_b]], axis=1))
+        tris.append(np.stack([p01[left_b], b00[left_b], b01[left_b]], axis=1))
+    if np.any(right_b):
+        tris.append(np.stack([p10[right_b], p11[right_b], b11[right_b]], axis=1))
+        tris.append(np.stack([p10[right_b], b11[right_b], b10[right_b]], axis=1))
+
+    all_tris = np.concatenate(tris, axis=0)
+    return write_binary_stl_with_normals(all_tris, stl_path)
+    # ==============================================================================
+# DIGICRAFT MATRIX PALACE - PART 2 OF 3
+# All 5 Wings: Textile, Cutout PBR/STL, Interactive 3D Voxels, Tiled Connectors & Gentype
+# ==============================================================================
 
 # ==========================================
 # 4. אגף א': טקסטיל, אריגת ז'קארד ומטריצת פיקסלים
 # ==========================================
-def generate_pixel_matrix(image_path, grid_width, num_colors, style, user_mode):
+def generate_pixel_matrix(image_path, grid_width, num_colors, style, current_user):
     try:
         img = ensure_clean_rgb(image_path)
         w, h = img.size
@@ -435,7 +757,7 @@ def generate_pixel_matrix(image_path, grid_width, num_colors, style, user_mode):
         total_px = sum(color_counter.values())
         swatches_html = build_color_swatches_html(sorted_colors, total_px)
 
-        svg_file, png_file = save_dual_outputs(svg_code, "textile_matrix", user_mode, f"טקסטיל: {style}")
+        svg_file, png_file = save_dual_outputs(svg_code, "textile_matrix", current_user, f"טקסטיל: {style}")
         preview_html = f'<div class="canvas-preview">{svg_code}</div>'
 
         return preview_html, swatches_html, svg_file, png_file
@@ -444,36 +766,73 @@ def generate_pixel_matrix(image_path, grid_width, num_colors, style, user_mode):
 
 
 # ==========================================
-# 5. אגף ב': טופוגרפיה, Heatmap, מפות PBR וייצוא STL לבמבו-לאב
+# 5. אגף ב': PBR & Cutout STL, Heatmap, טופוגרפיה וטקסטורות עומק
 # ==========================================
-def generate_contours(image_path, num_levels, blur_sigma, stroke_col, bg_col, user_mode):
+def generate_pbr_and_stl(image_path, mesh_res, smooth_sigma, contrast_boost, invert_map, cutout_bg, cutoff_thresh, tile_size_mm, base_thick_mm, relief_height_mm, current_user):
     try:
         img = ensure_clean_rgb(image_path).convert('L')
-        img_array = np.array(img)
-        smoothed = gaussian(img_array, sigma=blur_sigma, preserve_range=True)
-        height, width = smoothed.shape
+        if invert_map:
+            img = PIL.ImageOps.invert(img)
 
-        svg_lines = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" height="100%">']
-        svg_lines.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="{bg_col}"/>')
+        hm_arr = np.array(img, dtype=np.float32) / 255.0
+        if smooth_sigma > 0:
+            hm_arr = gaussian(hm_arr, sigma=smooth_sigma, preserve_range=True)
 
-        levels = np.linspace(10, 245, num_levels)
-        for level in levels:
-            contours = measure.find_contours(smoothed, level)
-            for contour in contours:
-                step = max(1, len(contour) // 180)
-                pts = contour[::step]
-                if len(pts) >= 2:
-                    path_data = "M " + " L ".join([f"{col:.1f} {row:.1f}" for row, col in pts])
-                    svg_lines.append(f'<path d="{path_data}" stroke="{stroke_col}" stroke-width="1.6" fill="none"/>')
+        hm_min, hm_max = hm_arr.min(), hm_arr.max()
+        if hm_max > hm_min:
+            hm_arr = (hm_arr - hm_min) / (hm_max - hm_min)
+        hm_arr = np.clip((hm_arr - 0.5) * contrast_boost + 0.5, 0.0, 1.0)
 
-        svg_lines.append('</svg>')
-        svg_code = "\n".join(svg_lines)
+        # אם הפינות בהירות והאובייקט כהה (למשל צילום על רקע לבן) ומצב חיתוך סילואט פעיל, נתאים כך שהאובייקט יבלוט
+        corners_mean = float(np.mean([hm_arr[0, 0], hm_arr[0, -1], hm_arr[-1, 0], hm_arr[-1, -1]]))
+        if cutout_bg and corners_mean > 0.75 and not invert_map:
+            hm_arr = 1.0 - hm_arr
 
-        svg_file, png_file = save_dual_outputs(svg_code, "topography_isolines", user_mode, "קווי גובה טופוגרפיים")
-        preview = f'<div class="canvas-preview">{svg_code}</div>'
-        return preview, svg_file, png_file
+        ts = int(time.time() * 1000)
+        hm_png_path = os.path.join(HISTORY_DIR, f"pbr_heightmap_{ts}.png")
+        hm_img = PIL.Image.fromarray((hm_arr * 255).astype(np.uint8), mode='L')
+        hm_img.save(hm_png_path, "PNG")
+
+        # הדמיית תאורה וצל (Relief Preview)
+        gy, gx = np.gradient(hm_arr * relief_height_mm)
+        nz = np.ones_like(hm_arr) * 0.35
+        norm = np.sqrt(gx ** 2 + gy ** 2 + nz ** 2)
+        lx, ly, lz = -0.55, -0.55, 0.62
+        shaded = np.clip((gx * lx + gy * ly + nz * lz) / norm, 0.0, 1.0)
+        if cutout_bg:
+            shaded = np.where(hm_arr > cutoff_thresh, shaded, 0.08)
+        shaded_img = PIL.Image.fromarray((shaded * 255).astype(np.uint8), mode='L').convert('RGB')
+
+        # בניית מודל ה-STL עם אפשרות חיתוך סילואט (ללא משטח ריבועי!)
+        w_orig, h_orig = img.size
+        aspect = h_orig / w_orig
+        nx = int(mesh_res)
+        ny = max(20, int(nx * aspect))
+        hm_mesh_img = hm_img.resize((nx, ny), PIL.Image.Resampling.LANCZOS)
+        z_grid = np.array(hm_mesh_img, dtype=np.float32) / 255.0
+
+        if not cutout_bg:
+            z_grid[0, :] *= 0.2
+            z_grid[-1, :] *= 0.2
+            z_grid[:, 0] *= 0.2
+            z_grid[:, -1] *= 0.2
+
+        stl_path = os.path.join(HISTORY_DIR, f"bambulab_model_{ts}.stl")
+        height_mm = tile_size_mm * aspect
+        heightmap_to_watertight_stl(
+            z_grid, stl_path,
+            width_mm=tile_size_mm, height_mm=height_mm,
+            base_mm=base_thick_mm, relief_mm=relief_height_mm,
+            cutout_bg=cutout_bg, cutoff_thresh=cutoff_thresh
+        )
+
+        save_to_history(current_user, "PBR Height Map + 3D STL", png_path=hm_png_path, stl_path=stl_path)
+
+        mode_str = "חיתוך צורני נקי (ללא משטח ריבועי)" if cutout_bg else "אריח מלא עם משטח בסיס"
+        specs_msg = f"<div class='telemetry-box'><b>מוכן ל-Bambu Studio ול-Blender:</b> מצב: {mode_str} | מידות: {tile_size_mm:.0f}x{height_mm:.0f} מ\"מ | בסיס: {base_thick_mm} מ\"מ | תבליט: {relief_height_mm} מ\"מ</div>"
+        return hm_img, shaded_img, stl_path, hm_png_path, stl_path, specs_msg
     except Exception as e:
-        return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
+        return None, None, None, None, None, f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>"
 
 
 def get_heatmap_palette(scheme):
@@ -499,7 +858,7 @@ def get_heatmap_palette(scheme):
         ]
 
 
-def generate_heatmap_room(image_path, mode_style, palette_name, resolution, blur_val, user_mode):
+def generate_heatmap_room(image_path, mode_style, palette_name, resolution, blur_val, current_user):
     try:
         img = ensure_clean_rgb(image_path).convert('L')
         w_orig, h_orig = img.size
@@ -557,179 +916,99 @@ def generate_heatmap_room(image_path, mode_style, palette_name, resolution, blur
 
         color_counts = [(c, 100) for c in pal]
         swatches_html = build_color_swatches_html(color_counts, len(pal) * 100)
-        svg_file, png_file = save_dual_outputs(svg_code, "heatmap_vector", user_mode, f"Heatmap: {palette_name}")
+        svg_file, png_file = save_dual_outputs(svg_code, "heatmap_vector", current_user, f"Heatmap: {palette_name}")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, swatches_html, svg_file, png_file
     except Exception as e:
         return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", "", None, None
 
 
-def heightmap_to_watertight_stl(z_grid, stl_path, width_mm=100.0, height_mm=100.0, base_mm=2.0, relief_mm=2.5):
-    """בונה קובץ STL בינארי אטום (Watertight) עם בסיס שטוח המוכן להדפסה ב-Bambu Studio"""
-    ny, nx = z_grid.shape
-    xs = np.linspace(0.0, width_mm, nx, dtype=np.float32)
-    ys = np.linspace(0.0, height_mm, ny, dtype=np.float32)
-    xv, yv = np.meshgrid(xs, ys)
-    yv = height_mm - yv
-    zv = base_mm + (z_grid.astype(np.float32) * relief_mm)
-
-    tris = []
-
-    p00 = np.stack([xv[:-1, :-1], yv[:-1, :-1], zv[:-1, :-1]], axis=-1)
-    p10 = np.stack([xv[:-1, 1:], yv[:-1, 1:], zv[:-1, 1:]], axis=-1)
-    p01 = np.stack([xv[1:, :-1], yv[1:, :-1], zv[1:, :-1]], axis=-1)
-    p11 = np.stack([xv[1:, 1:], yv[1:, 1:], zv[1:, 1:]], axis=-1)
-
-    t1 = np.stack([p00, p01, p11], axis=2).reshape(-1, 3, 3)
-    t2 = np.stack([p00, p11, p10], axis=2).reshape(-1, 3, 3)
-    tris.append(t1)
-    tris.append(t2)
-
-    b00 = np.array([0.0, height_mm, 0.0], dtype=np.float32)
-    b10 = np.array([width_mm, height_mm, 0.0], dtype=np.float32)
-    b01 = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    b11 = np.array([width_mm, 0.0, 0.0], dtype=np.float32)
-    base_tris = np.array([[b00, b10, b11], [b00, b11, b01]], dtype=np.float32)
-    tris.append(base_tris)
-
-    walls = []
-    for j in range(nx - 1):
-        vt1 = [xv[0, j], yv[0, j], zv[0, j]]
-        vt2 = [xv[0, j + 1], yv[0, j + 1], zv[0, j + 1]]
-        vb1 = [xv[0, j], yv[0, j], 0.0]
-        vb2 = [xv[0, j + 1], yv[0, j + 1], 0.0]
-        walls.extend([[vt1, vt2, vb2], [vt1, vb2, vb1]])
-    for j in range(nx - 1):
-        vt1 = [xv[-1, j], yv[-1, j], zv[-1, j]]
-        vt2 = [xv[-1, j + 1], yv[-1, j + 1], zv[-1, j + 1]]
-        vb1 = [xv[-1, j], yv[-1, j], 0.0]
-        vb2 = [xv[-1, j + 1], yv[-1, j + 1], 0.0]
-        walls.extend([[vt2, vt1, vb1], [vt2, vb1, vb2]])
-    for i in range(ny - 1):
-        vt1 = [xv[i, 0], yv[i, 0], zv[i, 0]]
-        vt2 = [xv[i + 1, 0], yv[i + 1, 0], zv[i + 1, 0]]
-        vb1 = [xv[i, 0], yv[i, 0], 0.0]
-        vb2 = [xv[i + 1, 0], yv[i + 1, 0], 0.0]
-        walls.extend([[vt2, vt1, vb1], [vt2, vb1, vb2]])
-    for i in range(ny - 1):
-        vt1 = [xv[i, -1], yv[i, -1], zv[i, -1]]
-        vt2 = [xv[i + 1, -1], yv[i + 1, -1], zv[i + 1, -1]]
-        vb1 = [xv[i, -1], yv[i, -1], 0.0]
-        vb2 = [xv[i + 1, -1], yv[i + 1, -1], 0.0]
-        walls.extend([[vt1, vt2, vb2], [vt1, vb2, vb1]])
-
-    tris.append(np.array(walls, dtype=np.float32))
-    all_tris = np.concatenate(tris, axis=0)
-
-    num_tris = all_tris.shape[0]
-    stl_dtype = np.dtype([
-        ('normal', '<f4', (3,)),
-        ('v1', '<f4', (3,)),
-        ('v2', '<f4', (3,)),
-        ('v3', '<f4', (3,)),
-        ('attr', '<u2')
-    ])
-    data = np.zeros(num_tris, dtype=stl_dtype)
-    data['v1'] = all_tris[:, 0, :]
-    data['v2'] = all_tris[:, 1, :]
-    data['v3'] = all_tris[:, 2, :]
-
-    with open(stl_path, 'wb') as f:
-        header = b"DIGICRAFT_MATRIX_BAMBULAB_STL".ljust(80, b' ')
-        f.write(header)
-        f.write(struct.pack('<I', num_tris))
-        f.write(data.tobytes())
-
-    return stl_path
-
-
-def generate_pbr_and_stl(image_path, mesh_res, smooth_sigma, contrast_boost, invert_map, tile_size_mm, base_thick_mm, relief_height_mm, user_mode):
+def generate_contours(image_path, num_levels, blur_sigma, stroke_col, bg_col, current_user):
     try:
         img = ensure_clean_rgb(image_path).convert('L')
-        if invert_map:
-            img = PIL.ImageOps.invert(img)
+        img_array = np.array(img)
+        smoothed = gaussian(img_array, sigma=blur_sigma, preserve_range=True)
+        height, width = smoothed.shape
 
-        hm_arr = np.array(img, dtype=np.float32) / 255.0
-        if smooth_sigma > 0:
-            hm_arr = gaussian(hm_arr, sigma=smooth_sigma, preserve_range=True)
+        svg_lines = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="100%" height="100%">']
+        svg_lines.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="{bg_col}"/>')
 
-        hm_min, hm_max = hm_arr.min(), hm_arr.max()
-        if hm_max > hm_min:
-            hm_arr = (hm_arr - hm_min) / (hm_max - hm_min)
-        hm_arr = np.clip((hm_arr - 0.5) * contrast_boost + 0.5, 0.0, 1.0)
+        levels = np.linspace(10, 245, num_levels)
+        for level in levels:
+            contours = measure.find_contours(smoothed, level)
+            for contour in contours:
+                step = max(1, len(contour) // 180)
+                pts = contour[::step]
+                if len(pts) >= 2:
+                    path_data = "M " + " L ".join([f"{col:.1f} {row:.1f}" for row, col in pts])
+                    svg_lines.append(f'<path d="{path_data}" stroke="{stroke_col}" stroke-width="1.6" fill="none"/>')
 
-        ts = int(time.time())
-        hm_png_path = os.path.join(HISTORY_DIR, f"pbr_heightmap_{ts}.png")
-        hm_img = PIL.Image.fromarray((hm_arr * 255).astype(np.uint8), mode='L')
-        hm_img.save(hm_png_path, "PNG")
+        svg_lines.append('</svg>')
+        svg_code = "\n".join(svg_lines)
 
-        gy, gx = np.gradient(hm_arr * relief_height_mm)
-        nz = np.ones_like(hm_arr) * 0.35
-        norm = np.sqrt(gx ** 2 + gy ** 2 + nz ** 2)
-        lx, ly, lz = -0.55, -0.55, 0.62
-        shaded = np.clip((gx * lx + gy * ly + nz * lz) / norm, 0.0, 1.0)
-        shaded_img = PIL.Image.fromarray((shaded * 255).astype(np.uint8), mode='L').convert('RGB')
+        svg_file, png_file = save_dual_outputs(svg_code, "topography_isolines", current_user, "קווי גובה טופוגרפיים")
+        preview = f'<div class="canvas-preview">{svg_code}</div>'
+        return preview, svg_file, png_file
+    except Exception as e:
+        return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
 
+
+def generate_depth_texture(image_path, grid_size, shape_type, fg_col, bg_col, current_user):
+    """מנוע עומק גיאומטרי פרמטרי שעובד מיידית ב-100% ללא תלות במפתח API"""
+    try:
+        img = ensure_clean_rgb(image_path).convert('L')
         w_orig, h_orig = img.size
         aspect = h_orig / w_orig
-        nx = int(mesh_res)
-        ny = max(20, int(nx * aspect))
-        hm_mesh_img = hm_img.resize((nx, ny), PIL.Image.Resampling.LANCZOS)
-        z_grid = np.array(hm_mesh_img, dtype=np.float32) / 255.0
+        gw = int(grid_size)
+        gh = max(5, int(gw * aspect))
 
-        z_grid[0, :] *= 0.2
-        z_grid[-1, :] *= 0.2
-        z_grid[:, 0] *= 0.2
-        z_grid[:, -1] *= 0.2
+        img_small = img.resize((gw, gh), PIL.Image.Resampling.LANCZOS)
+        pixels = img_small.load()
 
-        stl_path = os.path.join(HISTORY_DIR, f"bambulab_tile_{ts}.stl")
-        height_mm = tile_size_mm * aspect
-        heightmap_to_watertight_stl(z_grid, stl_path, width_mm=tile_size_mm, height_mm=height_mm, base_mm=base_thick_mm, relief_mm=relief_height_mm)
+        cell = 24
+        vw, vh = gw * cell, gh * cell
+        svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vw} {vh}" width="100%" height="100%">']
+        svg.append(f'<rect x="0" y="0" width="{vw}" height="{vh}" fill="{bg_col}"/>')
 
-        save_to_history(user_mode, "PBR Height Map + STL", png_path=hm_png_path, stl_path=stl_path)
+        for y in range(gh):
+            for x in range(gw):
+                lum = pixels[x, y] / 255.0
+                weight = 1.0 - lum if bg_col.lower() in ("#ffffff", "#fafafa") else lum
+                if weight < 0.08:
+                    continue
+                cx = x * cell + cell / 2.0
+                cy = y * cell + cell / 2.0
+                max_r = (cell * 0.46) * weight
 
-        specs_msg = f"<div class='telemetry-box'><b>מוכן ל-Bambu Studio ול-Blender:</b> מידות אריח: {tile_size_mm:.0f}x{height_mm:.0f} מ\"מ | עובי בסיס: {base_thick_mm} מ\"מ | גובה תבליט: {relief_height_mm} מ\"מ | רשת: {nx}x{ny}</div>"
-        return hm_img, shaded_img, stl_path, hm_png_path, stl_path, specs_msg
-    except Exception as e:
-        return None, None, None, None, None, f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>"
+                if shape_type == "Circles (מעגלים פרמטריים)":
+                    svg.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{max_r:.2f}" fill="none" stroke="{fg_col}" stroke-width="{max(1.0, weight*3.2):.2f}"/>')
+                elif shape_type == "Squares (ריבועים מדורגים)":
+                    s = max_r * 1.8
+                    svg.append(f'<rect x="{cx - s/2:.1f}" y="{cy - s/2:.1f}" width="{s:.1f}" height="{s:.1f}" fill="none" stroke="{fg_col}" stroke-width="{max(1.0, weight*2.8):.2f}"/>')
+                elif shape_type == "Hexagons (משושים גיאומטריים)":
+                    pts = []
+                    for i in range(6):
+                        ang = math.radians(i * 60)
+                        pts.append(f"{cx + max_r * math.cos(ang):.1f},{cy + max_r * math.sin(ang):.1f}")
+                    svg.append(f'<polygon points="{" ".join(pts)}" fill="none" stroke="{fg_col}" stroke-width="{max(1.0, weight*2.5):.2f}"/>')
+                else:  # Cross / Lines
+                    svg.append(f'<line x1="{cx - max_r:.1f}" y1="{cy - max_r:.1f}" x2="{cx + max_r:.1f}" y2="{cy + max_r:.1f}" stroke="{fg_col}" stroke-width="{max(1.0, weight*3.5):.2f}"/>')
+                    svg.append(f'<line x1="{cx + max_r:.1f}" y1="{cy - max_r:.1f}" x2="{cx - max_r:.1f}" y2="{cy + max_r:.1f}" stroke="{fg_col}" stroke-width="{max(1.0, weight*2.0):.2f}"/>')
 
+        svg.append('</svg>')
+        svg_code = "\n".join(svg)
 
-def generate_depth_texture(image_path, grid_size, shape_type, user_mode):
-    try:
-        if not os.environ.get("GEMINI_API_KEY"):
-            return "<p style='color:#ff5252;'>שגיאה: מפתח GEMINI_API_KEY לא הוגדר ב-Environment Variables של השרת.</p>", None, None
-
-        img = ensure_clean_rgb(image_path)
-        model = genai.GenerativeModel('gemini-2.5-pro')
-
-        prompt = f"""
-        You are an expert computational designer. Analyze the depth and brightness of the attached image.
-        Translate this visual data into a parametric 2D SVG texture.
-        Strict Technical Requirements:
-        1. Grid constraints: Create a grid of {grid_size}x{grid_size} geometric elements on viewBox="0 0 800 800".
-        2. Shape type: Use {shape_type} as the primary repeating element.
-        3. Parametric mapping: The size (radius/scale) or stroke-width of each {shape_type} MUST correspond directly to the brightness or perceived depth of that specific area in the image.
-        4. Style: Include <rect x="0" y="0" width="800" height="800" fill="#ffffff"/> and monochrome black shapes (#111111).
-        5. Clean code: Output ONLY the raw valid SVG code starting with <svg> and ending with </svg>. Do not wrap in ```svg tags.
-        """
-
-        response = model.generate_content([prompt, img])
-        svg_code = re.sub(r'```(?:xml|svg)?\n|```', '', response.text).strip()
-
-        svg_file, png_file = save_dual_outputs(svg_code, "ai_parametric_depth", user_mode, f"AI Depth: {shape_type}")
+        svg_file, png_file = save_dual_outputs(svg_code, "parametric_depth_texture", current_user, f"טקסטורת עומק: {shape_type}")
         preview_html = f'<div class="canvas-preview">{svg_code}</div>'
         return preview_html, svg_file, png_file
     except Exception as e:
         return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
-        # ==============================================================================
-# DIGICRAFT MATRIX PALACE - PART 2 OF 3
-# Wing C (Math Generators), Wing D (Panel Connector & Packaging), Wing E (Gentype)
-# ==============================================================================
+
 
 # ==========================================
-# 6. אגף ג': מחוללים מתמטיים (Wave, Voxel, Guilloche)
+# 6. אגף ג': מחוללים מתמטיים + Voxel Art אינטראקטיבי בתלת-ממד (3D STL)!
 # ==========================================
-def generate_waveform(image_path, num_lines, amp, color, user_mode):
+def generate_waveform(image_path, num_lines, amp, color, current_user):
     try:
         img = ensure_clean_rgb(image_path)
         w, h = 800, int(800 * (img.height / img.width))
@@ -760,14 +1039,43 @@ def generate_waveform(image_path, num_lines, amp, color, user_mode):
         svg.append('</svg>')
         svg_code = "\n".join(svg)
 
-        svg_file, png_file = save_dual_outputs(svg_code, "waveform_art", user_mode, "גלי קול (Waveform)")
+        svg_file, png_file = save_dual_outputs(svg_code, "waveform_art", current_user, "גלי קול (Waveform)")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, svg_file, png_file
     except Exception as e:
         return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
 
 
-def generate_iso_voxels(image_path, grid_width, extrusion, gap, user_mode):
+def build_voxel_3d_stl(active_voxels, stl_path):
+    """בונה קובץ STL תלת-ממדי אמיתי של עמודי הקוביות (Voxels) לצפייה אינטראקטיבית ולהדפסה"""
+    tris = []
+    for (x0, y0, x1, y1, z1) in active_voxels:
+        z0 = 0.0
+        v000 = [x0, y0, z0]
+        v100 = [x1, y0, z0]
+        v110 = [x1, y1, z0]
+        v010 = [x0, y1, z0]
+        v001 = [x0, y0, z1]
+        v101 = [x1, y0, z1]
+        v111 = [x1, y1, z1]
+        v011 = [x0, y1, z1]
+
+        tris.extend([
+            [v001, v101, v111], [v001, v111, v011],  # Top
+            [v000, v110, v100], [v000, v010, v110],  # Bottom
+            [v000, v100, v101], [v000, v101, v001],  # Front
+            [v110, v010, v011], [v110, v011, v111],  # Back
+            [v010, v000, v001], [v010, v001, v011],  # Left
+            [v100, v110, v111], [v100, v111, v101],  # Right
+        ])
+
+    if not tris:
+        tris = [[[0, 0, 0], [10, 0, 0], [0, 10, 1]]]
+    all_tris = np.array(tris, dtype=np.float32)
+    return write_binary_stl_with_normals(all_tris, stl_path)
+
+
+def generate_iso_voxels(image_path, grid_width, extrusion, gap, remove_bg_mode, current_user):
     try:
         img = ensure_clean_rgb(image_path)
         aspect = img.height / img.width
@@ -779,7 +1087,7 @@ def generate_iso_voxels(image_path, grid_width, extrusion, gap, user_mode):
 
         step_w = 10
         step_h = 5
-        base_h = 5
+        base_h = 4
 
         min_x = -grid_height * step_w
         max_x = grid_width * step_w
@@ -792,20 +1100,28 @@ def generate_iso_voxels(image_path, grid_width, extrusion, gap, user_mode):
         svg_h = max_y - min_y + (step_h * 4)
 
         svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{ox} {oy} {svg_w} {svg_h}" width="100%" height="100%">']
-        svg.append(f'<rect x="{ox}" y="{oy}" width="{svg_w}" height="{svg_h}" fill="#181818"/>')
+        svg.append(f'<rect x="{ox}" y="{oy}" width="{svg_w}" height="{svg_h}" fill="#141417"/>')
 
         dw = step_w - gap
         dh = step_h - (gap / 2.0)
 
         color_counter = {}
+        active_voxels_3d = []
+        cell_mm = 2.0
+        gap_mm = min(0.8, gap * 0.15)
+
         for y in range(grid_height):
             for x in range(grid_width):
                 r, g, b = pixels[x, y]
-                if r > 242 and g > 242 and b > 242:
+                lum = get_luminance(r, g, b)
+
+                # סינון רקע חכם: מונע את המעוין השחור בתמונות עם רקע כהה ומונע רקע לבן
+                if "בהיר" in remove_bg_mode and lum > 240:
+                    continue
+                if "כהה" in remove_bg_mode and lum < 22:
                     continue
 
                 color_counter[(r, g, b)] = color_counter.get((r, g, b), 0) + 1
-                lum = get_luminance(r, g, b)
                 h_z = base_h + (lum / 255.0) * extrusion
 
                 color_top = adjust_color(r, g, b, 1.0)
@@ -824,19 +1140,32 @@ def generate_iso_voxels(image_path, grid_width, extrusion, gap, user_mode):
                 svg.append(f'<polygon points="{p_right}" fill="{color_right}"/>')
                 svg.append(f'<polygon points="{p_top}" fill="{color_top}"/>')
 
+                # הוספת עמוד קובייה למודל התלת-ממדי האינטראקטיבי
+                vx0 = x * cell_mm + gap_mm
+                vy0 = (grid_height - 1 - y) * cell_mm + gap_mm
+                vx1 = (x + 1) * cell_mm - gap_mm
+                vy1 = (grid_height - y) * cell_mm - gap_mm
+                vz1 = 2.0 + (lum / 255.0) * (extrusion * 0.35)
+                active_voxels_3d.append((vx0, vy0, vx1, vy1, vz1))
+
         svg.append('</svg>')
         svg_code = "\n".join(svg)
 
         sorted_colors = sorted(color_counter.items(), key=lambda x: x[1], reverse=True)
-        swatches_html = build_color_swatches_html(sorted_colors, sum(color_counter.values()))
-        svg_file, png_file = save_dual_outputs(svg_code, "voxel_sculpture", user_mode, "פסל איזומטרי (Voxel Art)")
+        swatches_html = build_color_swatches_html(sorted_colors, max(1, sum(color_counter.values())))
+        svg_file, png_file = save_dual_outputs(svg_code, "voxel_sculpture", current_user, "פסל איזומטרי (Voxel Art)")
+
+        ts = int(time.time() * 1000)
+        stl_file = os.path.join(HISTORY_DIR, f"voxel_3d_{ts}.stl")
+        build_voxel_3d_stl(active_voxels_3d, stl_file)
+
         preview = f'<div class="canvas-preview">{svg_code}</div>'
-        return preview, swatches_html, svg_file, png_file
+        return preview, stl_file, swatches_html, svg_file, png_file, stl_file
     except Exception as e:
-        return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", "", None, None
+        return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, "", None, None, None
 
 
-def generate_adaptive_guilloche(image_path, num_colors, base_R, rotations, user_mode):
+def generate_adaptive_guilloche(image_path, num_colors, base_R, rotations, current_user):
     try:
         img = ensure_clean_rgb(image_path)
         w, h = 800, 800
@@ -878,7 +1207,7 @@ def generate_adaptive_guilloche(image_path, num_colors, base_R, rotations, user_
         svg_code = "\n".join(svg)
 
         swatches_html = build_color_swatches_html([(c[1], c[0]) for c in colors_counts[:num_colors]], w * h)
-        svg_file, png_file = save_dual_outputs(svg_code, "adaptive_guilloche", user_mode, "רוזטת גיליושה אדפטיבית")
+        svg_file, png_file = save_dual_outputs(svg_code, "adaptive_guilloche", current_user, "רוזטת גיליושה אדפטיבית")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, swatches_html, svg_file, png_file
     except Exception as e:
@@ -886,110 +1215,164 @@ def generate_adaptive_guilloche(image_path, num_colors, base_R, rotations, user_
 
 
 # ==========================================
-# 7. אגף ד': Panel Connector (מחברים מכניים) + פריסות אריזה וסימני דפוס
+# 7. אגף ד': Panel Connector (תצוגת מערך אריחים יושבים יחד + העלאת תמונה רשות)
 # ==========================================
 def build_connector_edge(x1, y1, x2, y2, conn_type, direction, tab_scale=1.0):
+    """בונה צלע עם שן מכנית מדויקת (זכר/נקבה) שננעלת בצורה חלקה באריח השכן"""
+    if direction == 0:
+        return f"{x2:.2f} {y2:.2f}"
     dx, dy = x2 - x1, y2 - y1
     length = math.hypot(dx, dy)
     ux, uy = dx / length, dy / length
     nx, ny = -uy * direction, ux * direction
 
     def pt(along, perp):
-        return f"{x1 + ux * along * length + nx * perp * length * tab_scale:.2f} {y1 + uy * along * length + ny * perp * length * tab_scale:.2f}"
+        px = x1 + ux * along * length + nx * (perp * length * tab_scale)
+        py = y1 + uy * along * length + ny * (perp * length * tab_scale)
+        return f"{px:.2f} {py:.2f}"
 
     if conn_type == "זנב סנונית (Dovetail Joint)":
-        pts = [pt(0, 0), pt(0.38, 0), pt(0.32, 0.14), pt(0.68, 0.14), pt(0.62, 0), pt(1.0, 0)]
+        pts = [pt(0.36, 0), pt(0.31, 0.15), pt(0.69, 0.15), pt(0.64, 0), pt(1.0, 0)]
     elif conn_type == "מחבר חץ מכני (Arrow Lock)":
-        pts = [pt(0, 0), pt(0.42, 0), pt(0.42, 0.08), pt(0.34, 0.08), pt(0.50, 0.20), pt(0.66, 0.08), pt(0.58, 0.08), pt(0.58, 0), pt(1.0, 0)]
-    else:
-        pts = [pt(0, 0), pt(0.40, 0), pt(0.35, 0.07), pt(0.40, 0.15), pt(0.50, 0.17), pt(0.60, 0.15), pt(0.65, 0.07), pt(0.60, 0), pt(1.0, 0)]
-
+        pts = [pt(0.42, 0), pt(0.42, 0.08), pt(0.33, 0.08), pt(0.50, 0.21), pt(0.67, 0.08), pt(0.58, 0.08), pt(0.58, 0), pt(1.0, 0)]
+    else:  # Omega Puzzle Lock
+        pts = [
+            pt(0.38, 0), pt(0.36, 0.05), pt(0.32, 0.11),
+            pt(0.37, 0.18), pt(0.50, 0.20), pt(0.63, 0.18),
+            pt(0.68, 0.11), pt(0.64, 0.05), pt(0.62, 0), pt(1.0, 0)
+        ]
     return " L ".join(pts)
 
 
-def generate_panel_connector(tile_shape, conn_type, inner_pattern, tile_size_mm, tab_scale, density, thickness_mm, user_mode):
+def generate_panel_connector(image_path, grid_layout, tile_shape, conn_type, inner_pattern, tile_size_mm, tab_scale, density, thickness_mm, current_user):
     try:
-        canvas = 500
-        cx, cy = canvas / 2, canvas / 2
-        half = 150
+        if "3x3" in grid_layout:
+            n_grid = 3
+        elif "2x2" in grid_layout:
+            n_grid = 2
+        else:
+            n_grid = 1
+
+        canvas = 660
+        margin = 75
+        usable = canvas - margin * 2
 
         svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {canvas} {canvas}" width="100%" height="100%">']
         svg.append(f'<rect x="0" y="0" width="{canvas}" height="{canvas}" fill="#141414"/>')
 
-        svg.append('<g stroke="#222222" stroke-width="0.6">')
-        for g in range(0, canvas, 25):
+        svg.append('<g stroke="#222228" stroke-width="0.6">')
+        for g in range(0, canvas, 30):
             svg.append(f'<line x1="{g}" y1="0" x2="{g}" y2="{canvas}"/>')
             svg.append(f'<line x1="0" y1="{g}" x2="{canvas}" y2="{g}"/>')
         svg.append('</g>')
 
+        # טעינת תמונה אופציונלית לפיזור על פני האריחים המחוברים
+        img_arr = None
+        if image_path:
+            img_gray = ensure_clean_rgb(image_path).convert('L').resize((canvas, canvas), PIL.Image.Resampling.LANCZOS)
+            img_arr = np.array(img_gray, dtype=np.float32) / 255.0
+
+        tile_centers = []
         if tile_shape == "אריח ריבועי מודולרי (Square Tiling)":
-            corners = [(cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half), (cx - half, cy + half)]
-            dirs = [1, 1, -1, -1]
+            step = usable / n_grid
+            half = (step / 2.0) - (1.8 if n_grid > 1 else 0.0)
+            for row in range(n_grid):
+                for col in range(n_grid):
+                    cx = margin + step * (col + 0.5)
+                    cy = margin + step * (row + 0.5)
+                    tile_centers.append((cx, cy, half, row, col))
+                    corners = [(cx - half, cy - half), (cx + half, cy - half), (cx + half, cy + half), (cx - half, cy + half)]
+                    # כיווני שיניים משלימים (Top=-1, Right=+1, Bottom=+1, Left=-1) כך שכל אריח ננעל בדיוק בשכן שלו!
+                    dirs = [-1, 1, 1, -1]
+                    segs = [build_connector_edge(corners[i][0], corners[i][1], corners[(i+1)%4][0], corners[(i+1)%4][1], conn_type, dirs[i], tab_scale) for i in range(4)]
+                    path_d = f"M {corners[0][0]:.2f} {corners[0][1]:.2f} L " + " L ".join(segs) + " Z"
+                    fill_c = "#202026" if (row + col) % 2 == 0 else "#26262e"
+                    svg.append(f'<path d="{path_d}" fill="{fill_c}" stroke="#00e5ff" stroke-width="2.0"/>')
         else:
-            corners = []
-            for i in range(6):
-                ang = math.radians(i * 60)
-                corners.append((cx + half * 1.15 * math.cos(ang), cy + half * 1.15 * math.sin(ang)))
-            dirs = [1, -1, 1, -1, 1, -1]
+            # מערך משושים (Honeycomb Interlocking Lattice)
+            rad = (usable / (n_grid * 1.85))
+            dx = rad * 1.5
+            dy = rad * math.sqrt(3)
+            for row in range(n_grid):
+                for col in range(n_grid):
+                    cx = margin + rad + col * dx
+                    cy = margin + rad + row * dy + (col % 2) * (dy / 2.0)
+                    r_draw = rad - (1.5 if n_grid > 1 else 0.0)
+                    tile_centers.append((cx, cy, r_draw * 0.85, row, col))
+                    corners = [(cx + r_draw * math.cos(math.radians(60 * i)), cy + r_draw * math.sin(math.radians(60 * i))) for i in range(6)]
+                    dirs = [1, 1, 1, -1, -1, -1]
+                    segs = [build_connector_edge(corners[i][0], corners[i][1], corners[(i+1)%6][0], corners[(i+1)%6][1], conn_type, dirs[i], tab_scale) for i in range(6)]
+                    path_d = f"M {corners[0][0]:.2f} {corners[0][1]:.2f} L " + " L ".join(segs) + " Z"
+                    svg.append(f'<path d="{path_d}" fill="#222228" stroke="#00e5ff" stroke-width="2.0"/>')
 
-        edge_segments = []
-        for i in range(len(corners)):
-            p1 = corners[i]
-            p2 = corners[(i + 1) % len(corners)]
-            seg = build_connector_edge(p1[0], p1[1], p2[0], p2[1], conn_type, dirs[i], tab_scale)
-            edge_segments.append(seg)
+        # פיזור הפאטרן או התמונה על פני כל האריחים יחד
+        for (cx, cy, half_r, row, col) in tile_centers:
+            inner_r = half_r * 0.72
+            if img_arr is not None:
+                # מיפוי התמונה שהועלתה אל תוך האריחים המחוברים
+                sub_n = max(4, int(density))
+                step_p = (inner_r * 2) / sub_n
+                for iy in range(sub_n):
+                    for ix in range(sub_n):
+                        px = (cx - inner_r) + (ix + 0.5) * step_p
+                        py = (cy - inner_r) + (iy + 0.5) * step_p
+                        ix_img = min(canvas - 1, max(0, int(px)))
+                        iy_img = min(canvas - 1, max(0, int(py)))
+                        val = 1.0 - img_arr[iy_img, ix_img]
+                        if val > 0.15:
+                            cr = (step_p * 0.44) * val
+                            svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{cr:.2f}" fill="#141414" stroke="#ff5252" stroke-width="1.3"/>')
 
-        outer_path = f"M {corners[0][0]:.2f} {corners[0][1]:.2f} L " + " L ".join(edge_segments) + " Z"
-        svg.append(f'<path d="{outer_path}" fill="#222222" stroke="#00e5ff" stroke-width="2.2"/>')
+            elif inner_pattern == "עורקי עלים אורגניים (Organic Venation)":
+                for b in range(int(density)):
+                    angle = (2 * math.pi * b) / density + (row * 0.3 + col * 0.3)
+                    ex = cx + inner_r * math.cos(angle)
+                    ey = cy + inner_r * math.sin(angle)
+                    mx = cx + (inner_r * 0.5) * math.cos(angle + 0.25)
+                    my = cy + (inner_r * 0.5) * math.sin(angle + 0.25)
+                    svg.append(f'<path d="M {cx:.1f} {cy:.1f} Q {mx:.1f} {my:.1f} {ex:.1f} {ey:.1f}" stroke="#ff5252" stroke-width="2.0" fill="none"/>')
 
-        inner_r = half * 0.78
-        if inner_pattern == "עורקי עלים אורגניים (Organic Venation)":
-            for b in range(int(density)):
-                angle = (2 * math.pi * b) / density
-                ex = cx + inner_r * math.cos(angle)
-                ey = cy + inner_r * math.sin(angle)
-                mx = cx + (inner_r * 0.5) * math.cos(angle + 0.25)
-                my = cy + (inner_r * 0.5) * math.sin(angle + 0.25)
-                svg.append(f'<path d="M {cx} {cy} Q {mx:.1f} {my:.1f} {ex:.1f} {ey:.1f}" stroke="#ff5252" stroke-width="2.5" fill="none"/>')
-                sx = mx + (inner_r * 0.32) * math.cos(angle - 0.5)
-                sy = my + (inner_r * 0.32) * math.sin(angle - 0.5)
-                svg.append(f'<line x1="{mx:.1f}" y1="{my:.1f}" x2="{sx:.1f}" y2="{sy:.1f}" stroke="#ff5252" stroke-width="1.5"/>')
+            elif inner_pattern == "רשת תאים / וורונוי (Cellular Web)":
+                rings = max(2, int(density // 3))
+                for r_idx in range(1, rings + 1):
+                    rad_c = (inner_r / rings) * r_idx
+                    num_pts = r_idx * 6
+                    for j in range(num_pts):
+                        a1 = (2 * math.pi * j) / num_pts + (r_idx * 0.2)
+                        px = cx + rad_c * math.cos(a1)
+                        py = cy + rad_c * math.sin(a1)
+                        hole_r = (inner_r / (rings * 2.3)) * (1.1 - 0.25 * (r_idx / rings))
+                        svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{hole_r:.1f}" fill="#141414" stroke="#ff5252" stroke-width="1.5"/>')
 
-        elif inner_pattern == "רשת תאים / וורונוי (Cellular Web)":
-            rings = max(2, int(density // 3))
-            for r_idx in range(1, rings + 1):
-                rad = (inner_r / rings) * r_idx
-                num_pts = r_idx * 6
-                for j in range(num_pts):
-                    a1 = (2 * math.pi * j) / num_pts + (r_idx * 0.2)
-                    px = cx + rad * math.cos(a1)
-                    py = cy + rad * math.sin(a1)
-                    hole_r = (inner_r / (rings * 2.2)) * (1.1 - 0.3 * (r_idx / rings))
-                    svg.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="{hole_r:.1f}" fill="#141414" stroke="#ff5252" stroke-width="1.8"/>')
+            elif inner_pattern == "גלים פרמטריים משתלבים (Continuous Wave Lattice)":
+                lines = max(3, int(density // 2))
+                step_l = (inner_r * 1.8) / lines
+                for l_idx in range(lines + 1):
+                    y_base = (cy - inner_r * 0.9) + l_idx * step_l
+                    pts = []
+                    for s in range(24):
+                        px = (cx - inner_r * 0.9) + (s / 23.0) * (inner_r * 1.8)
+                        py = y_base + math.sin((px / 35.0) * math.pi * 2) * 6.0
+                        pts.append(f"{px:.1f} {py:.1f}")
+                    svg.append(f'<path d="M {" L ".join(pts)}" stroke="#ff5252" stroke-width="1.8" fill="none"/>')
 
-        elif inner_pattern == "גלים פרמטריים משתלבים (Parametric Wave Lattice)":
-            lines = int(density)
-            step = (inner_r * 1.8) / max(1, lines)
-            for l_idx in range(lines + 1):
-                y_base = (cy - inner_r * 0.9) + l_idx * step
-                pts = []
-                for s in range(30):
-                    px = (cx - inner_r * 0.9) + (s / 29.0) * (inner_r * 1.8)
-                    py = y_base + math.sin((s / 29.0) * math.pi * 4 + l_idx) * 8.0
-                    pts.append(f"{px:.1f} {py:.1f}")
-                svg.append(f'<path d="M {" L ".join(pts)}" stroke="#ff5252" stroke-width="1.8" fill="none"/>')
-
-        svg.append(f'<text x="{cx}" y="{canvas - 14}" fill="#888888" font-family="monospace" font-size="10" text-anchor="middle">PANEL_CONNECTOR // {tile_size_mm:.0f}MM // JOINT: {conn_type} // CUT: #00E5FF</text>')
+        svg.append(f'<text x="{canvas/2}" y="{canvas - 14}" fill="#888888" font-family="monospace" font-size="11" text-anchor="middle">PANEL_ASSEMBLY: {n_grid}x{n_grid} // TILE: {tile_size_mm:.0f}MM // JOINT: {conn_type}</text>')
         svg.append('</svg>')
         svg_code = "\n".join(svg)
 
-        svg_file, png_file = save_dual_outputs(svg_code, "panel_connector", user_mode, f"Panel Connector: {conn_type}")
+        svg_file, png_file = save_dual_outputs(svg_code, "panel_connector_assembly", current_user, f"Panel Connector ({n_grid}x{n_grid})")
 
-        png_img = PIL.Image.open(png_file).convert('L').resize((110, 110), PIL.Image.Resampling.LANCZOS)
-        z_arr = (np.array(png_img, dtype=np.float32) > 25).astype(np.float32)
-        ts = int(time.time())
+        # הפקת קובץ STL תלת-ממדי חתוך בדיוק לפי צורת האריחים והשיניים (ללא משטח ריבועי מסביב!)
+        png_img = PIL.Image.open(png_file).convert('L').resize((130, 130), PIL.Image.Resampling.LANCZOS)
+        z_arr = np.where(np.array(png_img, dtype=np.float32) > 28, 1.0, 0.0).astype(np.float32)
+        ts = int(time.time() * 1000)
         stl_file = os.path.join(HISTORY_DIR, f"panel_connector_{ts}.stl")
-        heightmap_to_watertight_stl(z_arr, stl_file, width_mm=tile_size_mm, height_mm=tile_size_mm, base_mm=0.4, relief_mm=thickness_mm)
+        heightmap_to_watertight_stl(
+            z_arr, stl_file,
+            width_mm=tile_size_mm * n_grid, height_mm=tile_size_mm * n_grid,
+            base_mm=0.2, relief_mm=thickness_mm,
+            cutout_bg=True, cutoff_thresh=0.1
+        )
 
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, stl_file, svg_file, png_file, stl_file
@@ -1017,7 +1400,7 @@ def embed_graphic(file_path, target_x, target_y, target_w, target_h, scale_pct=1
         return f'<image x="{final_x}" y="{final_y}" width="{final_w}" height="{final_h}" opacity="{opacity}" href="data:image/{ext};base64,{b64_data}" preserveAspectRatio="xMidYMid slice"/>'
 
 
-def generate_custom_dieline(file_path, shape_type, w, h, d, graphic_mode, show_specs, user_mode):
+def generate_custom_dieline(file_path, shape_type, w, h, d, graphic_mode, show_specs, current_user):
     try:
         margin = 40
         glue = 18
@@ -1149,14 +1532,14 @@ def generate_custom_dieline(file_path, shape_type, w, h, d, graphic_mode, show_s
         svg.append('</svg>')
         svg_code = "\n".join(svg)
 
-        svg_file, png_file = save_dual_outputs(svg_code, "dieline_package", user_mode, f"פריסת אריזה: {shape_type}")
+        svg_file, png_file = save_dual_outputs(svg_code, "dieline_package", current_user, f"פריסת אריזה: {shape_type}")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, svg_file, png_file
     except Exception as e:
         return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
 
 
-def generate_print_marks(file_path, artboard_w, artboard_h, bleed, style_theme, user_mode):
+def generate_print_marks(file_path, artboard_w, artboard_h, bleed, style_theme, current_user):
     try:
         margin = 35
         canvas_w, canvas_h = artboard_w + (margin * 2), artboard_h + (margin * 2)
@@ -1199,7 +1582,7 @@ def generate_print_marks(file_path, artboard_w, artboard_h, bleed, style_theme, 
         svg.append('</g></svg>')
 
         svg_code = "\n".join(svg)
-        svg_file, png_file = save_dual_outputs(svg_code, "registration_marks", user_mode, "סימני רישום ודפוס")
+        svg_file, png_file = save_dual_outputs(svg_code, "registration_marks", current_user, "סימני רישום ודפוס")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, svg_file, png_file
     except Exception as e:
@@ -1207,30 +1590,31 @@ def generate_print_marks(file_path, artboard_w, artboard_h, bleed, style_theme, 
 
 
 # ==========================================
-# 8. אגף ה': Gentype Studio (מחולל טיפוגרפיה גנרטיבית מאוחד)
+# 8. אגף ה': Gentype Studio (עם בורר פונטים בעברית ובאנגלית!)
 # ==========================================
-def generate_gentype_typography(text_input, style_preset, custom_theme, engine_mode, primary_col, accent_col, user_mode):
+def generate_gentype_typography(text_input, font_choice, style_preset, custom_theme, engine_mode, primary_col, accent_col, current_user):
     try:
         text_clean = (text_input or "DIGICRAFT").strip()
+        font_family = font_choice.split(" (")[0].strip()
         w, h = 900, 420
 
-        if engine_mode == "Gemini AI SVG Typography (דורש מכסת API)" and os.environ.get("GEMINI_API_KEY"):
+        if engine_mode == "Gemini AI SVG Typography (דורש מפתח API בשרת)" and os.environ.get("GEMINI_API_KEY") and genai:
             model = genai.GenerativeModel('gemini-2.5-pro')
             prompt = f"""
             You are a master computational typographer and generative SVG artist.
-            Create an expressive, intricate, high-fashion vector SVG typographic artwork spelling the exact text: "{text_clean}".
-            Visual Style Preset: {style_preset}. Additional theme details: {custom_theme}.
+            Create an expressive vector SVG typographic artwork spelling the exact text: "{text_clean}".
+            Font Family to use: "{font_family}". Visual Style Preset: {style_preset}. Additional theme details: {custom_theme}.
             Color Palette: Background #121212, Primary {primary_col}, Accent {accent_col}.
-            Technical rules:
-            1. Use viewBox="0 0 {w} {h}" and start with <rect x="0" y="0" width="{w}" height="{h}" fill="#121212"/>.
-            2. Construct ornate vector paths, geometric weaves, liquid chrome gradients, or organic tendrils around/forming the letters.
-            3. Output ONLY valid raw <svg>...</svg> code without markdown backticks.
+            Output ONLY valid raw <svg viewBox="0 0 {w} {h}">...</svg> code without markdown backticks.
             """
             response = model.generate_content(prompt)
             svg_code = re.sub(r'```(?:xml|svg)?\n|```', '', response.text).strip()
         else:
             svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="100%" height="100%">']
             svg.append(f'''<defs>
+                <style>
+                    @import url('https://fonts.googleapis.com/css2?family=Assistant:wght@700;800&amp;family=Cinzel:wght@700;900&amp;family=Frank+Ruhl+Libre:wght@700;900&amp;family=Heebo:wght@700;900&amp;family=Orbitron:wght@700;900&amp;family=Playfair+Display:ital,wght@0,800;1,800&amp;family=Rubik:wght@700;900&amp;family=Space+Mono:wght@700&amp;family=Syne:wght@700;800&amp;display=swap');
+                </style>
                 <linearGradient id="chromeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
                     <stop offset="0%" stop-color="{primary_col}"/>
                     <stop offset="50%" stop-color="#ffffff"/>
@@ -1241,7 +1625,7 @@ def generate_gentype_typography(text_input, style_preset, custom_theme, engine_m
 
             num_chars = max(1, len(text_clean))
             step_x = (w - 120) / num_chars
-            font_sz = int(min(180, step_x * 1.15))
+            font_sz = int(min(175, step_x * 1.15))
 
             for idx, ch in enumerate(text_clean):
                 cx = 60 + step_x * (idx + 0.5)
@@ -1251,14 +1635,14 @@ def generate_gentype_typography(text_input, style_preset, custom_theme, engine_m
                     for layer in range(12, 0, -1):
                         off = layer * 2.2
                         col = accent_col if layer % 2 == 0 else "#2a2a35"
-                        svg.append(f'<text x="{cx + off:.1f}" y="{cy + off:.1f}" font-family="sans-serif" font-weight="900" font-size="{font_sz}" fill="none" stroke="{col}" stroke-width="2" text-anchor="middle" dominant-baseline="central">{ch}</text>')
-                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="sans-serif" font-weight="900" font-size="{font_sz}" fill="url(#chromeGrad)" stroke="#ffffff" stroke-width="1.5" text-anchor="middle" dominant-baseline="central">{ch}</text>')
+                        svg.append(f'<text x="{cx + off:.1f}" y="{cy + off:.1f}" font-family="\'{font_family}\', sans-serif" font-weight="900" font-size="{font_sz}" fill="none" stroke="{col}" stroke-width="2" text-anchor="middle" dominant-baseline="central">{ch}</text>')
+                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="\'{font_family}\', sans-serif" font-weight="900" font-size="{font_sz}" fill="url(#chromeGrad)" stroke="#ffffff" stroke-width="1.5" text-anchor="middle" dominant-baseline="central">{ch}</text>')
 
                 elif style_preset == "Cyber Stitch & Loom (רקמה ורשת דיגיטלית)":
                     for r_off in range(-40, 45, 10):
                         svg.append(f'<line x1="{cx - step_x*0.4:.1f}" y1="{cy + r_off:.1f}" x2="{cx + step_x*0.4:.1f}" y2="{cy - r_off:.1f}" stroke="{accent_col}" stroke-width="0.8"/>')
-                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="monospace" font-weight="bold" font-size="{font_sz}" fill="none" stroke="{primary_col}" stroke-width="4" stroke-dasharray="6,4" text-anchor="middle" dominant-baseline="central">{ch}</text>')
-                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="monospace" font-weight="bold" font-size="{font_sz}" fill="{primary_col}" opacity="0.85" text-anchor="middle" dominant-baseline="central">{ch}</text>')
+                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="\'{font_family}\', monospace" font-weight="800" font-size="{font_sz}" fill="none" stroke="{primary_col}" stroke-width="4" stroke-dasharray="6,4" text-anchor="middle" dominant-baseline="central">{ch}</text>')
+                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="\'{font_family}\', monospace" font-weight="800" font-size="{font_sz}" fill="{primary_col}" opacity="0.85" text-anchor="middle" dominant-baseline="central">{ch}</text>')
 
                 else:
                     for b in range(10):
@@ -1267,20 +1651,20 @@ def generate_gentype_typography(text_input, style_preset, custom_theme, engine_m
                         ry = cy + math.sin(ang) * (font_sz * 0.55)
                         svg.append(f'<path d="M {cx} {cy} Q {cx + 25} {cy - 25} {rx:.1f} {ry:.1f}" stroke="{accent_col}" stroke-width="1.5" fill="none"/>')
                         svg.append(f'<circle cx="{rx:.1f}" cy="{ry:.1f}" r="3.5" fill="{primary_col}"/>')
-                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="serif" font-weight="bold" font-size="{font_sz}" fill="{primary_col}" stroke="#121212" stroke-width="2" text-anchor="middle" dominant-baseline="central">{ch}</text>')
+                    svg.append(f'<text x="{cx:.1f}" y="{cy:.1f}" font-family="\'{font_family}\', serif" font-weight="800" font-size="{font_sz}" fill="{primary_col}" stroke="#121212" stroke-width="2" text-anchor="middle" dominant-baseline="central">{ch}</text>')
 
-            svg.append(f'<text x="{w/2}" y="{h - 16}" fill="#666666" font-family="monospace" font-size="10" text-anchor="middle">GENTYPE_STUDIO // STYLE: {style_preset} // INPUT: {text_clean}</text>')
+            svg.append(f'<text x="{w/2}" y="{h - 16}" fill="#777777" font-family="monospace" font-size="10" text-anchor="middle">GENTYPE_STUDIO // FONT: {font_family.upper()} // STYLE: {style_preset}</text>')
             svg.append('</svg>')
             svg_code = "\n".join(svg)
 
-        svg_file, png_file = save_dual_outputs(svg_code, "gentype_studio", user_mode, f"Gentype: {text_clean}")
+        svg_file, png_file = save_dual_outputs(svg_code, "gentype_studio", current_user, f"Gentype ({font_family}): {text_clean}")
         preview = f'<div class="canvas-preview">{svg_code}</div>'
         return preview, svg_file, png_file
     except Exception as e:
         return f"<p style='color:#ff5252;'>שגיאה: {str(e)}</p>", None, None
         # ==============================================================================
 # DIGICRAFT MATRIX PALACE - PART 3 OF 3
-# Custom Stitch UI/UX CSS, Unified Wings Interface & Render Server Launch
+# Custom Stitch CSS, Auth & Admin Control Room, Auto-Gallery & Unified Wings UI
 # ==============================================================================
 
 STITCH_CSS = """
@@ -1336,7 +1720,7 @@ body, .gradio-container {
     border: 1px solid #2e2e38;
     border-radius: 10px;
     padding: 16px;
-    max-width: 620px;
+    max-width: 640px;
     margin: 0 auto;
     box-shadow: inset 0 0 24px rgba(0,0,0,0.6);
 }
@@ -1414,33 +1798,65 @@ button.primary {
 }
 """
 
+
+def on_app_load(current_user):
+    record_visit()
+    g_imgs, g_files, g_html = get_history_display(current_user)
+    adm_html = get_admin_dashboard(current_user)
+    return g_imgs, g_files, g_html, adm_html
+
+
 # ==========================================
 # בניית הארמון המאוחד: DigiCraft Matrix
 # ==========================================
 with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STITCH_CSS) as master_studio:
 
+    current_user_state = gr.State("mai")
+
     gr.HTML("""
     <div class="stitch-header">
         <div>
             <h1 class="stitch-title">🏰 DIGICRAFT MATRIX // COMPUTATIONAL DESIGN PALACE</h1>
-            <div class="stitch-subtitle">ACTIVE TUNE // PIXEL-TO-VECTOR · JACQUARD · PBR & BAMBU STL · PANEL CONNECTORS · GENTYPE</div>
+            <div class="stitch-subtitle">ACTIVE TUNE // JACQUARD · CUTOUT PBR STL · 3D VOXELS · TILED CONNECTORS · GENTYPE · ADMIN</div>
         </div>
         <div style="text-align:left; font-family:'Space Mono', monospace; font-size:11px; color:#888;">
             <div>RENDER_ENGINE: ONLINE</div>
-            <div style="color:#4caf50;">● ARCHIVE_RETENTION: 7 DAYS</div>
+            <div style="color:#4caf50;">● AUTO_ARCHIVE: 7 DAYS</div>
         </div>
     </div>
     """)
 
     with gr.Row():
-        user_mode_radio = gr.Radio(
-            choices=[
-                "🔐 משתמשת רשומה: Mai (שמירה אוטומטית בגלריה ל-7 ימים)",
-                "👤 מצב אורח (ללא שמירה בגלריית ההיסטוריה)"
-            ],
-            value="🔐 משתמשת רשומה: Mai (שמירה אוטומטית בגלריה ל-7 ימים)",
-            label="מצב חיבור ופרטיות גלריה"
+        user_status_badge = gr.Textbox(
+            value="🟢 מחובר/ת: mai (מנהלת מערכת - Admin) — שמירה אוטומטית בגלריה פעילה",
+            label="סטטוס חיבור נוכחי",
+            interactive=False,
+            scale=3
         )
+        guest_quick_btn = gr.Button("👤 מעבר מהיר למצב אורח", scale=1)
+
+    with gr.Accordion("🔐 כניסת משתמשים / הרשמה / שחזור סיסמה בדוא\"ל (לחצי לפתיחה)", open=False):
+        auth_feedback = gr.HTML()
+        with gr.Tabs():
+            with gr.Tab("התחברות (Login)"):
+                with gr.Row():
+                    login_user = gr.Textbox(label="שם משתמש", value="mai")
+                    login_pass = gr.Textbox(label="סיסמה", type="password", value="DigiCraft2026")
+                    login_btn = gr.Button("התחבר/י", variant="primary")
+            with gr.Tab("הרשמת משתמש חדש"):
+                with gr.Row():
+                    reg_user = gr.Textbox(label="בחירת שם משתמש")
+                    reg_email = gr.Textbox(label="כתובת דוא\"ל (לשחזור סיסמה)")
+                    reg_pass = gr.Textbox(label="בחירת סיסמה", type="password")
+                    reg_btn = gr.Button("צור חשבון והתחבר", variant="primary")
+            with gr.Tab("שחזור סיסמה באמצעות דוא\"ל"):
+                with gr.Row():
+                    rec_email = gr.Textbox(label="הזיני את כתובת הדוא\"ל המשויכת לחשבון")
+                    rec_send_btn = gr.Button("שלח קוד שחזור לדוא\"ל")
+                with gr.Row():
+                    rec_code = gr.Textbox(label="קוד אימות (6 ספרות)")
+                    rec_new_pass = gr.Textbox(label="סיסמה חדשה", type="password")
+                    rec_reset_btn = gr.Button("אפס סיסמה", variant="primary")
 
     with gr.Tabs():
 
@@ -1465,7 +1881,7 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                     )
                     r1_grid = gr.Slider(minimum=10, maximum=140, step=2, value=56, label="צפיפות רשת דגימה (Grid Size)")
                     r1_colors = gr.Slider(minimum=2, maximum=20, step=1, value=8, label="הגבלת פלטת חוטים (DMC Floss Colors)")
-                    r1_btn = gr.Button("⚡ הפעל סינתזת מטריצה (SVG + PNG)", variant="primary")
+                    r1_btn = gr.Button("⚡ הפעל סינתזת מטריצה (נשמר אוטומטית בגלריה)", variant="primary")
 
                 with gr.Column(scale=1):
                     r1_preview = gr.HTML(label="תצוגת השוואה וקטורית")
@@ -1474,22 +1890,19 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                         r1_out_svg = gr.File(label="📥 הורדת קובץ וקטורי (SVG)")
                         r1_out_png = gr.File(label="🖼️ הורדת תמונה חדה (PNG)")
 
-            r1_btn.click(
-                fn=generate_pixel_matrix,
-                inputs=[r1_img, r1_grid, r1_colors, r1_style, user_mode_radio],
-                outputs=[r1_preview, r1_palette, r1_out_svg, r1_out_png]
-            )
-
         # ==========================================
         # אגף ב': עומק, Heatmap, מפות PBR ו-STL לבמבו-לאב
         # ==========================================
         with gr.Tab("⛰️ אגף ב': עומק, Heatmap, PBR ו-STL לתלת-ממד"):
             with gr.Tabs():
 
-                with gr.Tab("🧊 מעבדת PBR Height Map & ייצוא STL (לבלנדר ולבמבו-לאב)"):
+                with gr.Tab("🧊 מעבדת PBR Height Map & ייצוא STL (ללא משטח ריבועי!)"):
                     with gr.Row():
                         with gr.Column(scale=1):
                             pbr_img = gr.Image(label="העלאת תמונה / טקסטורה להמרה לתבליט תלת-ממד", type="filepath")
+                            with gr.Row():
+                                pbr_cutout = gr.Checkbox(label="✂️ חיתוך צורני ללא משטח ריבועי (Silhouette Cutout)", value=True)
+                                pbr_thresh = gr.Slider(minimum=0.02, maximum=0.45, step=0.02, value=0.10, label="סף חיתוך רקע (Cutoff Threshold)")
                             with gr.Row():
                                 pbr_res = gr.Slider(minimum=40, maximum=160, step=10, value=100, label="רזולוציית רשת תלת-ממד (Mesh Grid)")
                                 pbr_smooth = gr.Slider(minimum=0.0, maximum=5.0, step=0.5, value=1.0, label="החלקת משטח (Gaussian Smooth)")
@@ -1497,9 +1910,9 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                                 pbr_contrast = gr.Slider(minimum=0.5, maximum=3.0, step=0.1, value=1.3, label="עוצמת קונטרסט עומק (PBR Contrast)")
                                 pbr_invert = gr.Checkbox(label="היפוך גבהים (Invert Black/White)", value=False)
                             with gr.Row():
-                                pbr_size = gr.Slider(minimum=30, maximum=220, step=5, value=100, label="רוחב אריח פיזי (מ\"מ)")
-                                pbr_base = gr.Slider(minimum=0.8, maximum=10.0, step=0.2, value=2.0, label="עובי בסיס שטוח (מ\"מ)")
-                                pbr_relief = gr.Slider(minimum=0.4, maximum=8.0, step=0.2, value=2.4, label="גובה תבליט הטקסטורה (מ\"מ)")
+                                pbr_size = gr.Slider(minimum=30, maximum=220, step=5, value=100, label="רוחב אריח/אובייקט (מ\"מ)")
+                                pbr_base = gr.Slider(minimum=0.4, maximum=8.0, step=0.2, value=1.6, label="עובי בסיס (מ\"מ)")
+                                pbr_relief = gr.Slider(minimum=0.5, maximum=10.0, step=0.2, value=3.0, label="גובה תבליט הטקסטורה (מ\"מ)")
                             pbr_btn = gr.Button("🔨 ייצר מפת גובה (PBR) + קובץ STL מוכן ל-Bambu Studio", variant="primary")
 
                         with gr.Column(scale=1):
@@ -1507,16 +1920,10 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 pbr_hm_prev = gr.Image(label="מפת גובה (Non-Color Height Map לבלנדר)")
                                 pbr_shade_prev = gr.Image(label="הדמיית תאורה וצל (Relief Preview)")
-                            pbr_stl_viewer = gr.Model3D(label="תצוגה מקדימה תלת-ממדית חיה (אינטראקטיבי - לאישור ה-STL)")
+                            pbr_stl_viewer = gr.Model3D(label="תצוגה תלת-ממדית חיה מוארת (סובבי עם העכבר)")
                             with gr.Row():
                                 pbr_out_png = gr.File(label="🖼️ הורדת Height Map (PNG לבלנדר)")
                                 pbr_out_stl = gr.File(label="📦 הורדת קובץ 3D STL (ישירות ל-Bambu Lab)")
-
-                    pbr_btn.click(
-                        fn=generate_pbr_and_stl,
-                        inputs=[pbr_img, pbr_res, pbr_smooth, pbr_contrast, pbr_invert, pbr_size, pbr_base, pbr_relief, user_mode_radio],
-                        outputs=[pbr_hm_prev, pbr_shade_prev, pbr_stl_viewer, pbr_out_png, pbr_out_stl, pbr_specs]
-                    )
 
                 with gr.Tab("🔥 חדר Heatmap (מפת חום וקטורית וטרמית)"):
                     with gr.Row():
@@ -1552,12 +1959,6 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                                 hm_out_svg = gr.File(label="📥 הורדת SVG")
                                 hm_out_png = gr.File(label="🖼️ הורדת PNG")
 
-                    hm_btn.click(
-                        fn=generate_heatmap_room,
-                        inputs=[hm_img, hm_style, hm_pal, hm_res, hm_blur, user_mode_radio],
-                        outputs=[hm_prev, hm_swatches, hm_out_svg, hm_out_png]
-                    )
-
                 with gr.Tab("🗺️ קווי גובה טופוגרפיים (Isolines)"):
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -1573,35 +1974,64 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 r2_c_svg = gr.File(label="📥 הורדת SVG")
                                 r2_c_png = gr.File(label="🖼️ הורדת PNG")
-                    r2_c_btn.click(
-                        fn=generate_contours,
-                        inputs=[r2_c_img, r2_c_levels, r2_c_blur, r2_c_stroke, r2_c_bg, user_mode_radio],
-                        outputs=[r2_c_prev, r2_c_svg, r2_c_png]
-                    )
 
-                with gr.Tab("🌊 טקסטורות עומק גיאומטריות (AI)"):
+                with gr.Tab("🌊 טקסטורות עומק גיאומטריות (ללא צורך ב-API)"):
                     with gr.Row():
                         with gr.Column(scale=1):
                             r2_d_img = gr.Image(label="העלאת תמונה", type="filepath")
-                            r2_d_grid = gr.Slider(minimum=10, maximum=25, step=1, value=15, label="צפיפות רשת הגיאומטריה")
-                            r2_d_shape = gr.Dropdown(choices=["Circles", "Squares", "Hexagons", "Lines"], value="Circles", label="צורת בסיס")
+                            r2_d_grid = gr.Slider(minimum=10, maximum=45, step=1, value=24, label="צפיפות רשת הגיאומטריה")
+                            r2_d_shape = gr.Dropdown(
+                                choices=[
+                                    "Circles (מעגלים פרמטריים)",
+                                    "Squares (ריבועים מדורגים)",
+                                    "Hexagons (משושים גיאומטריים)",
+                                    "Cross / Lines (צלבים וקווים)"
+                                ],
+                                value="Circles (מעגלים פרמטריים)",
+                                label="צורת בסיס"
+                            )
+                            with gr.Row():
+                                r2_d_fg = gr.ColorPicker(value="#00e5ff", label="צבע אלמנטים")
+                                r2_d_bg = gr.ColorPicker(value="#141417", label="צבע רקע")
                             r2_d_btn = gr.Button("ייצר טקסטורת עומק (SVG + PNG)", variant="primary")
                         with gr.Column(scale=1):
                             r2_d_prev = gr.HTML(label="תצוגה מקדימה")
                             with gr.Row():
                                 r2_d_svg = gr.File(label="📥 הורדת SVG")
                                 r2_d_png = gr.File(label="🖼️ הורדת PNG")
-                    r2_d_btn.click(
-                        fn=generate_depth_texture,
-                        inputs=[r2_d_img, r2_d_grid, r2_d_shape, user_mode_radio],
-                        outputs=[r2_d_prev, r2_d_svg, r2_d_png]
-                    )
 
         # ==========================================
-        # אגף ג': מחוללים מתמטיים
+        # אגף ג': מחוללים מתמטיים (כולל Voxel 3D אינטראקטיבי!)
         # ==========================================
-        with gr.Tab("📐 אגף ג': מחוללים מתמטיים (Wave, Voxel, Guilloche)"):
+        with gr.Tab("📐 אגף ג': מחוללים מתמטיים (Wave, 3D Voxel, Guilloche)"):
             with gr.Tabs():
+                with gr.Tab("🧊 פסל אדריכלי תלת-ממדי אינטראקטיבי (3D Voxel Art)"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            r3_i_img = gr.Image(label="העלאת תמונה", type="filepath")
+                            r3_i_bg_mode = gr.Radio(
+                                choices=[
+                                    "הסר רקע כהה ובהיר אוטומטית (ללא משטח ריבועי)",
+                                    "הסר רקע כהה בלבד (כמו בצילום תרמי)",
+                                    "הסר רקע בהיר בלבד",
+                                    "השאר את כל המשטח"
+                                ],
+                                value="הסר רקע כהה ובהיר אוטומטית (ללא משטח ריבועי)",
+                                label="סינון משטח רקע"
+                            )
+                            r3_i_w = gr.Slider(minimum=12, maximum=75, step=1, value=38, label="רזולוציה (קוביות לרוחב)")
+                            r3_i_ext = gr.Slider(minimum=5, maximum=120, step=5, value=45, label="בליטה תלת-ממדית (Z-Extrusion)")
+                            r3_i_gap = gr.Slider(minimum=0, maximum=4, step=0.5, value=0.8, label="ריווח בין עמודים")
+                            r3_i_btn = gr.Button("🧊 ייצר פסל ווקסלים אינטראקטיבי (3D STL + SVG + PNG)", variant="primary")
+                        with gr.Column(scale=1):
+                            r3_i_stl_view = gr.Model3D(label="תצוגת 3D אינטראקטיבית של הקוביות (סובבי עם העכבר)")
+                            r3_i_prev = gr.HTML(label="תצוגה איזומטרית וקטורית (2D SVG)")
+                            r3_i_swatches = gr.HTML(label="דוגמיות צבע")
+                            with gr.Row():
+                                r3_i_svg = gr.File(label="📥 הורדת SVG")
+                                r3_i_png = gr.File(label="🖼️ הורדת PNG")
+                                r3_i_stl = gr.File(label="📦 הורדת 3D STL")
+
                 with gr.Tab("〰️ גלי קול (Waveform)"):
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -1615,31 +2045,6 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 r3_w_svg = gr.File(label="📥 הורדת SVG")
                                 r3_w_png = gr.File(label="🖼️ הורדת PNG")
-                    r3_w_btn.click(
-                        fn=generate_waveform,
-                        inputs=[r3_w_img, r3_w_lines, r3_w_amp, r3_w_col, user_mode_radio],
-                        outputs=[r3_w_prev, r3_w_svg, r3_w_png]
-                    )
-
-                with gr.Tab("🧊 פסל אדריכלי תלת-ממדי (Voxel Art)"):
-                    with gr.Row():
-                        with gr.Column(scale=1):
-                            r3_i_img = gr.Image(label="העלאת תמונה", type="filepath")
-                            r3_i_w = gr.Slider(minimum=10, maximum=100, step=1, value=45, label="רזולוציה (קוביות לרוחב)")
-                            r3_i_ext = gr.Slider(minimum=0, maximum=150, step=5, value=45, label="בליטה תלת-ממדית (Z-Extrusion)")
-                            r3_i_gap = gr.Slider(minimum=0, maximum=6, step=0.5, value=1, label="ריווח בין עמודים")
-                            r3_i_btn = gr.Button("ייצר פסל תלת-ממדי (SVG + PNG)", variant="primary")
-                        with gr.Column(scale=1):
-                            r3_i_prev = gr.HTML(label="תצוגה מקדימה")
-                            r3_i_swatches = gr.HTML(label="דוגמיות צבע")
-                            with gr.Row():
-                                r3_i_svg = gr.File(label="📥 הורדת SVG")
-                                r3_i_png = gr.File(label="🖼️ הורדת PNG")
-                    r3_i_btn.click(
-                        fn=generate_iso_voxels,
-                        inputs=[r3_i_img, r3_i_w, r3_i_ext, r3_i_gap, user_mode_radio],
-                        outputs=[r3_i_prev, r3_i_swatches, r3_i_svg, r3_i_png]
-                    )
 
                 with gr.Tab("🌸 גיליושה אדפטיבית (Adaptive Geometry)"):
                     with gr.Row():
@@ -1655,21 +2060,26 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 r3_g_svg = gr.File(label="📥 הורדת SVG")
                                 r3_g_png = gr.File(label="🖼️ הורדת PNG")
-                    r3_g_btn.click(
-                        fn=generate_adaptive_guilloche,
-                        inputs=[r3_g_img, r3_g_col, r3_g_R, r3_g_rot, user_mode_radio],
-                        outputs=[r3_g_prev, r3_g_swatches, r3_g_svg, r3_g_png]
-                    )
 
         # ==========================================
-        # אגף ד': Panel Connector, אריזה ודפוס
+        # אגף ד': Panel Connector (תצוגת אריחים יושבים יחד), אריזה ודפוס
         # ==========================================
         with gr.Tab("🧩 אגף ד': מחברים מכניים (Panel Connector), אריזה ודפוס"):
             with gr.Tabs():
 
-                with gr.Tab("🔗 Panel Connector (מחולל אריחים ומחברים מכניים פרמטריים)"):
+                with gr.Tab("🔗 Panel Connector (תצוגת הרכבה של אריחים יושבים יחד)"):
                     with gr.Row():
                         with gr.Column(scale=1):
+                            pc_img = gr.Image(label="העלאת תמונה לחריטה על פני האריחים (אופציונלי - לא חובה!)", type="filepath")
+                            pc_layout = gr.Radio(
+                                choices=[
+                                    "מערך 2x2 אריחים מחוברים יחד (Assembly View)",
+                                    "מערך 3x3 אריחים מחוברים יחד (Full Spread)",
+                                    "אריח בודד (1x1 Single Tile)"
+                                ],
+                                value="מערך 2x2 אריחים מחוברים יחד (Assembly View)",
+                                label="תצוגת חיבור ופיזור אריחים"
+                            )
                             pc_shape = gr.Radio(
                                 choices=[
                                     "אריח ריבועי מודולרי (Square Tiling)",
@@ -1691,33 +2101,27 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                                 choices=[
                                     "עורקי עלים אורגניים (Organic Venation)",
                                     "רשת תאים / וורונוי (Cellular Web)",
-                                    "גלים פרמטריים משתלבים (Parametric Wave Lattice)",
+                                    "גלים פרמטריים משתלבים (Continuous Wave Lattice)",
                                     "אריח חלק ללא חריטה פנימית (Solid Mechanical Tile)"
                                 ],
                                 value="עורקי עלים אורגניים (Organic Venation)",
-                                label="פאטרן אורגני פנימי"
+                                label="פאטרן אורגני פנימי (כאשר לא מועלית תמונה)"
                             )
                             with gr.Row():
-                                pc_size = gr.Slider(minimum=40, maximum=200, step=5, value=90, label="גודל אריח (מ\"מ)")
-                                pc_scale = gr.Slider(minimum=0.6, maximum=1.5, step=0.1, value=1.0, label="גודל שן מחבר")
+                                pc_size = gr.Slider(minimum=40, maximum=200, step=5, value=90, label="גודל אריח יחיד (מ\"מ)")
+                                pc_scale = gr.Slider(minimum=0.6, maximum=1.4, step=0.1, value=1.0, label="גודל שן מחבר")
                             with gr.Row():
-                                pc_density = gr.Slider(minimum=4, maximum=24, step=2, value=12, label="צפיפות פאטרן פנימי")
+                                pc_density = gr.Slider(minimum=4, maximum=24, step=2, value=10, label="צפיפות פאטרן פנימי")
                                 pc_thick = gr.Slider(minimum=1.5, maximum=8.0, step=0.5, value=3.0, label="עובי אריח ל-STL (מ\"מ)")
-                            pc_btn = gr.Button("⚙️ ייצר אריח מכני (SVG + PNG + 3D STL)", variant="primary")
+                            pc_btn = gr.Button("⚙️ ייצר מערך אריחים מחוברים (SVG + PNG + 3D STL)", variant="primary")
 
                         with gr.Column(scale=1):
-                            pc_prev = gr.HTML(label="שרטוט וקטורי של האריח")
-                            pc_stl_view = gr.Model3D(label="הדמיית STL תלת-ממדית של האריח")
+                            pc_prev = gr.HTML(label="שרטוט הרכבה וקטורי (איך שהאריחים יושבים יחד)")
+                            pc_stl_view = gr.Model3D(label="הדמיית 3D STL אינטראקטיבית של האריחים (ללא רקע ריבועי)")
                             with gr.Row():
                                 pc_out_svg = gr.File(label="📥 הורדת SVG (לחיתוך/בלנדר)")
                                 pc_out_png = gr.File(label="🖼️ הורדת PNG")
                                 pc_out_stl = gr.File(label="📦 הורדת STL (ל-Bambu Lab)")
-
-                    pc_btn.click(
-                        fn=generate_panel_connector,
-                        inputs=[pc_shape, pc_joint, pc_pattern, pc_size, pc_scale, pc_density, pc_thick, user_mode_radio],
-                        outputs=[pc_prev, pc_stl_view, pc_out_svg, pc_out_png, pc_out_stl]
-                    )
 
                 with gr.Tab("📦 מחולל גזרות אריזה (Multi-Shape Dielines)"):
                     with gr.Row():
@@ -1751,11 +2155,6 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 r4_d_svg = gr.File(label="📥 הורדת SVG")
                                 r4_d_png = gr.File(label="🖼️ הורדת PNG")
-                    r4_d_btn.click(
-                        fn=generate_custom_dieline,
-                        inputs=[r4_d_file, r4_d_shape, r4_d_w, r4_d_h, r4_d_d, r4_d_mode, r4_d_specs, user_mode_radio],
-                        outputs=[r4_d_prev, r4_d_svg, r4_d_png]
-                    )
 
                 with gr.Tab("🎯 פילטר סימני רישום וכוונות (Registration Overlay)"):
                     with gr.Row():
@@ -1771,19 +2170,29 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                             with gr.Row():
                                 r4_r_svg = gr.File(label="📥 הורדת SVG")
                                 r4_r_png = gr.File(label="🖼️ הורדת PNG")
-                    r4_r_btn.click(
-                        fn=generate_print_marks,
-                        inputs=[r4_r_file, r4_r_w, r4_r_h, r4_r_b, r4_r_theme, user_mode_radio],
-                        outputs=[r4_r_prev, r4_r_svg, r4_r_png]
-                    )
 
         # ==========================================
-        # אגף ה': Gentype Studio (מחולל טיפוגרפיה)
+        # אגף ה': Gentype Studio (עם בורר פונטים!)
         # ==========================================
-        with gr.Tab("🔤 אגף ה': Gentype Studio (טיפוגרפיה גנרטיבית)"):
+        with gr.Tab("🔤 אגף ה': Gentype Studio (טיפוגרפיה גנרטיבית ובחירת פונטים)"):
             with gr.Row():
                 with gr.Column(scale=1):
                     gt_text = gr.Textbox(value="MAI STUDIO", label="הזנת אותיות / מילה (עברית או אנגלית)")
+                    gt_font = gr.Dropdown(
+                        choices=[
+                            "Rubik (עברית/אנגלית - גיאומטרי עגול)",
+                            "Heebo (עברית/אנגלית - מודרני נקי)",
+                            "Frank Ruhl Libre (עברית/אנגלית - סריף קלאסי)",
+                            "Assistant (עברית/אנגלית - דו-לשוני)",
+                            "Orbitron (אנגלית - סייבר ועתידני)",
+                            "Syne (אנגלית - אקספרימנטלי ואמנותי)",
+                            "Cinzel (אנגלית - רומי מלכותי)",
+                            "Playfair Display (אנגלית - אופנה ויוקרה)",
+                            "Space Mono (מונוספייס טכני)"
+                        ],
+                        value="Orbitron (אנגלית - סייבר ועתידני)",
+                        label="בחירת פונט (Font Family)"
+                    )
                     gt_style = gr.Radio(
                         choices=[
                             "Y2K Liquid Chrome (כרום נוזלי ותלת-ממד)",
@@ -1796,12 +2205,12 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                     gt_engine = gr.Radio(
                         choices=[
                             "מנוע וקטורי פרמטרי מיידי (ללא תלות במכסת API)",
-                            "Gemini AI SVG Typography (דורש מכסת API)"
+                            "Gemini AI SVG Typography (דורש מפתח API בשרת)"
                         ],
                         value="מנוע וקטורי פרמטרי מיידי (ללא תלות במכסת API)",
                         label="מנוע ייצור"
                     )
-                    gt_theme = gr.Textbox(placeholder="תיאור חופשי נוסף (למצב AI): למשל מתכת נוזלית, קוצים, זכוכית...", label="הנחיית עיצוב נוספת (אופציונלי)")
+                    gt_theme = gr.Textbox(placeholder="תיאור חופשי נוסף (למצב AI)...", label="הנחיית עיצוב נוספת (אופציונלי)")
                     with gr.Row():
                         gt_col1 = gr.ColorPicker(value="#e86c52", label="צבע ראשי")
                         gt_col2 = gr.ColorPicker(value="#00e5ff", label="צבע משני / הדגשה")
@@ -1813,24 +2222,132 @@ with gr.Blocks(title="DigiCraft Matrix Palace", theme=gr.themes.Base(), css=STIT
                         gt_svg = gr.File(label="📥 הורדת SVG וקטורי")
                         gt_png = gr.File(label="🖼️ הורדת PNG")
 
-            gt_btn.click(
-                fn=generate_gentype_typography,
-                inputs=[gt_text, gt_style, gt_theme, gt_engine, gt_col1, gt_col2, user_mode_radio],
-                outputs=[gt_prev, gt_svg, gt_png]
-            )
-
         # ==========================================
-        # אגף ו': גלריית היסטוריה ל-7 ימים
+        # אגף ו': גלריית היסטוריה אוטומטית ל-7 ימים
         # ==========================================
-        with gr.Tab("🗂️ אגף ו': גלריית היסטוריה (שמירה ל-7 ימים)"):
-            gr.Markdown("### ארכיון התוצרים של הסטודיו (קבצים שנוצרו ב-7 הימים האחרונים במצב משתמשת רשומה)")
-            hist_refresh_btn = gr.Button("🔄 רענן גלריה ובדוק קבצים שמורים", variant="primary")
+        with gr.Tab("🗂️ אגף ו': גלריית היסטוריה אוטומטית (7 ימים)") as tab_gallery:
+            gr.Markdown("### ארכיון יצירות אוטומטי (כל תוצר שנוצר בחדרים נשמר ומופיע כאן מיד ללא צורך להוריד למחשב)")
+            hist_refresh_btn = gr.Button("🔄 רענן גלריה עכשיו", variant="primary")
             hist_info = gr.HTML()
             with gr.Row():
-                hist_gallery = gr.Gallery(label="תצוגה מקדימה של תוצרים שמורים", columns=4, height="auto")
-                hist_files = gr.File(label="הורדת קבצים מהארכיון (SVG / PNG / STL)")
+                hist_gallery = gr.Gallery(label="תצוגה מקדימה של כל התוצרים השמורים", columns=4, height="auto")
+                hist_files = gr.File(label="הורדת קבצים שמורים מהארכיון (SVG / PNG / STL)")
 
-            hist_refresh_btn.click(fn=get_history_display, inputs=[], outputs=[hist_gallery, hist_files, hist_info])
+        # ==========================================
+        # אגף ז': חדר בקרה למנהלת (Admin Control Room)
+        # ==========================================
+        with gr.Tab("🛡️ אגף ז': חדר בקרה למנהלת (Admin)") as tab_admin:
+            admin_refresh_btn = gr.Button("🔄 רענן נתוני מערכת וסטטיסטיקות", variant="primary")
+            admin_html = gr.HTML()
+
+    # ==========================================
+    # חיבורי אירועים, שמירה ורענון אוטומטי לגלריה ולחדר הבקרה
+    # ==========================================
+    master_studio.load(
+        fn=on_app_load,
+        inputs=[current_user_state],
+        outputs=[hist_gallery, hist_files, hist_info, admin_html]
+    )
+
+    login_btn.click(
+        fn=handle_login,
+        inputs=[login_user, login_pass],
+        outputs=[current_user_state, user_status_badge, auth_feedback]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info]).then(fn=get_admin_dashboard, inputs=[current_user_state], outputs=[admin_html])
+
+    reg_btn.click(
+        fn=handle_register,
+        inputs=[reg_user, reg_email, reg_pass],
+        outputs=[current_user_state, user_status_badge, auth_feedback]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    guest_quick_btn.click(
+        fn=handle_guest_mode,
+        inputs=[],
+        outputs=[current_user_state, user_status_badge, auth_feedback]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    rec_send_btn.click(fn=send_recovery_email, inputs=[rec_email], outputs=[auth_feedback])
+    rec_reset_btn.click(fn=reset_password_with_code, inputs=[rec_email, rec_code, rec_new_pass], outputs=[auth_feedback])
+
+    # רענון אוטומטי בלחיצה על לשונית הגלריה או לשונית המנהלת
+    tab_gallery.select(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+    hist_refresh_btn.click(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+    tab_admin.select(fn=get_admin_dashboard, inputs=[current_user_state], outputs=[admin_html])
+    admin_refresh_btn.click(fn=get_admin_dashboard, inputs=[current_user_state], outputs=[admin_html])
+
+    # חיבור כל החדרים + עדכון אוטומטי של הגלריה מיד בסיום כל יצירה!
+    r1_btn.click(
+        fn=generate_pixel_matrix,
+        inputs=[r1_img, r1_grid, r1_colors, r1_style, current_user_state],
+        outputs=[r1_preview, r1_palette, r1_out_svg, r1_out_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    pbr_btn.click(
+        fn=generate_pbr_and_stl,
+        inputs=[pbr_img, pbr_res, pbr_smooth, pbr_contrast, pbr_invert, pbr_cutout, pbr_thresh, pbr_size, pbr_base, pbr_relief, current_user_state],
+        outputs=[pbr_hm_prev, pbr_shade_prev, pbr_stl_viewer, pbr_out_png, pbr_out_stl, pbr_specs]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    hm_btn.click(
+        fn=generate_heatmap_room,
+        inputs=[hm_img, hm_style, hm_pal, hm_res, hm_blur, current_user_state],
+        outputs=[hm_prev, hm_swatches, hm_out_svg, hm_out_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r2_c_btn.click(
+        fn=generate_contours,
+        inputs=[r2_c_img, r2_c_levels, r2_c_blur, r2_c_stroke, r2_c_bg, current_user_state],
+        outputs=[r2_c_prev, r2_c_svg, r2_c_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r2_d_btn.click(
+        fn=generate_depth_texture,
+        inputs=[r2_d_img, r2_d_grid, r2_d_shape, r2_d_fg, r2_d_bg, current_user_state],
+        outputs=[r2_d_prev, r2_d_svg, r2_d_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r3_i_btn.click(
+        fn=generate_iso_voxels,
+        inputs=[r3_i_img, r3_i_w, r3_i_ext, r3_i_gap, r3_i_bg_mode, current_user_state],
+        outputs=[r3_i_prev, r3_i_stl_view, r3_i_swatches, r3_i_svg, r3_i_png, r3_i_stl]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r3_w_btn.click(
+        fn=generate_waveform,
+        inputs=[r3_w_img, r3_w_lines, r3_w_amp, r3_w_col, current_user_state],
+        outputs=[r3_w_prev, r3_w_svg, r3_w_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r3_g_btn.click(
+        fn=generate_adaptive_guilloche,
+        inputs=[r3_g_img, r3_g_col, r3_g_R, r3_g_rot, current_user_state],
+        outputs=[r3_g_prev, r3_g_swatches, r3_g_svg, r3_g_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    pc_btn.click(
+        fn=generate_panel_connector,
+        inputs=[pc_img, pc_layout, pc_shape, pc_joint, pc_pattern, pc_size, pc_scale, pc_density, pc_thick, current_user_state],
+        outputs=[pc_prev, pc_stl_view, pc_out_svg, pc_out_png, pc_out_stl]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r4_d_btn.click(
+        fn=generate_custom_dieline,
+        inputs=[r4_d_file, r4_d_shape, r4_d_w, r4_d_h, r4_d_d, r4_d_mode, r4_d_specs, current_user_state],
+        outputs=[r4_d_prev, r4_d_svg, r4_d_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    r4_r_btn.click(
+        fn=generate_print_marks,
+        inputs=[r4_r_file, r4_r_w, r4_r_h, r4_r_b, r4_r_theme, current_user_state],
+        outputs=[r4_r_prev, r4_r_svg, r4_r_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
+
+    gt_btn.click(
+        fn=generate_gentype_typography,
+        inputs=[gt_text, gt_font, gt_style, gt_theme, gt_engine, gt_col1, gt_col2, current_user_state],
+        outputs=[gt_prev, gt_svg, gt_png]
+    ).then(fn=get_history_display, inputs=[current_user_state], outputs=[hist_gallery, hist_files, hist_info])
 
 port = int(os.environ.get("PORT", 7860))
 master_studio.launch(server_name="0.0.0.0", server_port=port)
