@@ -1,0 +1,5 @@
+gradio
+google-generativeai
+Pillow
+numpy
+scikit-image
